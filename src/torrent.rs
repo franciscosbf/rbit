@@ -8,206 +8,53 @@ use url::Url;
 
 use crate::error::RbitError;
 
-#[derive(Debug)]
-struct NonZeroUnsigned(u64);
-
-impl From<u64> for NonZeroUnsigned {
-    fn from(value: u64) -> Self {
-        NonZeroUnsigned(value)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for NonZeroUnsigned {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct NonZeroUnsignedVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for NonZeroUnsignedVisitor {
-            type Value = NonZeroUnsigned;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("positive integer")
-            }
-
-            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if v > 0 {
-                    Ok(NonZeroUnsigned(v as u64))
-                } else {
-                    Err(E::custom("negative/zero value isn't allowed"))
-                }
-            }
-        }
-
-        deserializer.deserialize_i64(NonZeroUnsignedVisitor)
-    }
-}
-
-fn deserialize_url<'de, D>(deserializer: D) -> Result<Url, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct UrlVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for UrlVisitor {
-        type Value = Url;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("string")
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            let url = Url::parse(v).map_err(|_| E::custom("invalid url"))?;
-
-            Ok(url)
-        }
-    }
-
-    deserializer.deserialize_str(UrlVisitor)
-}
-
-fn deserialize_single_path<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct SinglePathVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for SinglePathVisitor {
-        type Value = PathBuf;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("string")
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            let path = PathBuf::from_str(v.strip_suffix('/').unwrap_or(v))
-                .map_err(|_| E::custom("invalid path"))?;
-
-            if path.parent() != Some(Path::new("")) {
-                return Err(E::custom("path isn't unique"));
-            }
-
-            if path.has_root() {
-                return Err(E::custom("path contains root"));
-            }
-
-            Ok(path)
-        }
-    }
-
-    deserializer.deserialize_str(SinglePathVisitor)
-}
-
-fn deserialize_multi_path<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct MultiPathVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for MultiPathVisitor {
-        type Value = PathBuf;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("sequency of strings")
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::SeqAccess<'de>,
-        {
-            let mut raw = vec![];
-            while let Some(item) = seq.next_element::<&str>()? {
-                raw.push(item);
-            }
-
-            if raw.is_empty() {
-                return Err(serde::de::Error::custom("invalid path"));
-            }
-
-            let path = raw.iter().collect::<PathBuf>();
-
-            if path.has_root() {
-                return Err(serde::de::Error::custom("invalid path"));
-            }
-
-            Ok(path)
-        }
-    }
-
-    deserializer.deserialize_seq(MultiPathVisitor)
-}
-
-fn deserialize_byte_buf<'de, D>(deserializer: D) -> Result<ByteBuf, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-
-    match ByteBuf::deserialize(deserializer) {
-        Ok(buf) => {
-            if !buf.is_empty() && buf.len() % 20 == 0 {
-                Ok(buf)
-            } else {
-                Err(serde::de::Error::custom("invalid byte sequence"))
-            }
-        }
-        e => e,
-    }
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct File {
-    length: NonZeroUnsigned,
-    #[serde(deserialize_with = "deserialize_multi_path")]
-    path: PathBuf,
+    length: i64,
+    path: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct Info {
-    #[serde(deserialize_with = "deserialize_single_path")]
-    name: PathBuf,
-    piece: NonZeroUnsigned,
-    #[serde(deserialize_with = "deserialize_byte_buf")]
+    name: String,
+    piece: i64,
     pieces: ByteBuf,
-    length: Option<NonZeroUnsigned>,
+    length: Option<i64>,
     files: Option<Vec<File>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct Metainfo {
-    #[serde(deserialize_with = "deserialize_url")]
-    announce: Url,
+    announce: String,
     info: Info,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Pieces {
-    pieces: ByteBuf,
+    buf: ByteBuf,
 }
 
 impl Pieces {
-    fn new(pieces: ByteBuf) -> Self {
-        Self { pieces }
-    }
-
     pub fn get_sha1(&self, index: usize) -> Option<&[u8]> {
         let rindex = index * 20;
 
-        if !(0..self.pieces.len()).contains(&rindex) {
-            return None;
+        if (0..self.buf.len()).contains(&rindex) {
+            Some(&self.buf[rindex..(rindex + 20)])
+        } else {
+            None
         }
+    }
+}
 
-        Some(&self.pieces[rindex..(rindex + 20)])
+impl TryFrom<ByteBuf> for Pieces {
+    type Error = RbitError;
+
+    fn try_from(pieces: ByteBuf) -> Result<Self, Self::Error> {
+        if !pieces.is_empty() && pieces.len() % 20 == 0 {
+            Ok(Pieces { buf: pieces })
+        } else {
+            Err(RbitError::InvalidField("info.pieces"))
+        }
     }
 }
 
@@ -249,61 +96,255 @@ impl Torrent {
 }
 
 pub fn parse(raw: &[u8]) -> Result<Torrent, RbitError> {
-    let file = serde_bencode::from_bytes::<Metainfo>(raw).map_err(|_| RbitError::ParseFailed)?;
+    let file = serde_bencode::from_bytes::<Metainfo>(raw).map_err(|_| RbitError::InvalidFile)?;
 
     let info = file.info;
 
+    let tracker = Url::parse(&file.announce).map_err(|_| RbitError::InvalidField("announce"))?;
+
+    let raw_name = info.name.strip_suffix('/').unwrap_or(&info.name);
+    let name = PathBuf::from_str(raw_name).map_err(|_| RbitError::InvalidField("info.name"))?;
+
+    if name.parent() != Some(Path::new("")) || name.has_root() {
+        return Err(RbitError::InvalidField("info.name"));
+    }
+
+    let piece = if info.piece > 0 {
+        info.piece as u64
+    } else {
+        return Err(RbitError::InvalidField("info.piece"));
+    };
+
+    let pieces = Pieces::try_from(info.pieces)?;
+
     let file_type = match (info.length, info.files) {
         (Some(length), None) => {
-            let name = info.name;
-            let length = length.0;
+            let length = if length > 0 {
+                length as u64
+            } else {
+                return Err(RbitError::InvalidField("info.length"));
+            };
 
             FileType::Single { name, length }
         }
         (None, Some(files)) => {
-            let dir = info.name;
+            let dir = name;
             let files = files
                 .into_iter()
                 .map(|f| {
-                    let length = f.length.0;
-                    let path = f.path;
-                    if path.starts_with(dir.to_str().unwrap()) {
-                        Err(RbitError::ParseFailed)
+                    let length = if f.length > 0 {
+                        f.length as u64
                     } else {
+                        return Err(RbitError::InvalidField("info.files.length"));
+                    };
+                    let path = f.path.iter().collect::<PathBuf>();
+
+                    if path.starts_with(raw_name) {
                         Ok(FileMeta::new(length, path))
+                    } else {
+                        Err(RbitError::InvalidField("info.files.path"))
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
             FileType::Multi { dir, files }
         }
-        _ => return Err(RbitError::ParseFailed),
+        _ => return Err(RbitError::InvalidFile),
     };
 
-    let torrent = Torrent::new(
-        file.announce,
-        info.piece.0,
-        Pieces::new(info.pieces),
-        file_type,
-    );
+    let torrent = Torrent::new(tracker, piece, pieces, file_type);
 
     Ok(torrent)
 }
 
 #[cfg(test)]
 mod tests {
-    use claim::assert_ok;
+    use std::path::{Path, PathBuf};
+
+    use claim::{assert_matches, assert_none, assert_ok, assert_some_eq};
     use serde_bytes::ByteBuf;
     use url::Url;
 
-    use crate::parse;
-
-    use super::{Info, Metainfo, NonZeroUnsigned};
+    use crate::{error::RbitError, parse, FileType, Pieces};
 
     #[test]
-    fn parse_valid_torrent() {
-        let raw = b"d8:announce17:https://test.com/4:infod6:lengthi32e4:name4:test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+    fn get_pieces_chunk_wih_valid_chunk() {
+        let pieces = Pieces {
+            buf: ByteBuf::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
+        };
+
+        assert_some_eq!(pieces.get_sha1(0), b"AAAAAAAAAAAAAAAAAAAA".as_slice());
+        assert_some_eq!(pieces.get_sha1(1), b"BBBBBBBBBBBBBBBBBBBB".as_slice());
+    }
+
+    #[test]
+    fn get_pieces_chunk_wih_invalid_chunk() {
+        let pieces = Pieces {
+            buf: ByteBuf::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
+        };
+
+        assert_none!(pieces.get_sha1(2));
+    }
+
+    #[test]
+    fn parse_valid_torrent_with_single_file() {
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e4:\
+            name4:test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
         let torrent = assert_ok!(parse(raw));
+        assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
+        assert_eq!(torrent.piece, 1);
+        assert_eq!(
+            torrent.pieces.buf,
+            ByteBuf::from(b"BBBBBBBBBBBBBBBBBBBB".as_slice())
+        );
+        match torrent.file_type {
+            FileType::Single { name, length } => {
+                assert_eq!(name, Path::new("test"));
+                assert_eq!(length, 1);
+            }
+            _ => panic!("didn't match single file"),
+        }
+    }
+
+    #[test]
+    fn parse_valid_torrent_with_multi_file() {
+        let raw = b"d8:announce16:https://test.com4:infod5:files\
+            ld6:lengthi1e4:pathl5:tests9:test1.txteed6:lengthi2e4:\
+            pathl5:tests9:test2.txteee4:name5:tests5:piecei2e6:\
+            pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+
+        let torrent = assert_ok!(parse(raw));
+        let torrent = assert_ok!(parse(raw));
+        assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
+        assert_eq!(torrent.piece, 2);
+        assert_eq!(
+            torrent.pieces.buf,
+            ByteBuf::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice())
+        );
+        match torrent.file_type {
+            FileType::Multi { dir, files } => {
+                assert_eq!(dir, Path::new("tests"));
+                assert_eq!(files.len(), 2);
+                let test1 = &files[0];
+                assert_eq!(test1.length, 1);
+                assert_eq!(test1.path, Path::new("tests/test1.txt"));
+                let test2 = &files[1];
+                assert_eq!(test2.length, 2);
+                assert_eq!(test2.path, Path::new("tests/test2.txt"));
+            }
+            _ => panic!("didn't match multi file"),
+        }
+    }
+
+    #[test]
+    fn parse_invalid_torrent_file() {
+        let raw = b"d8:announcei45e4:infod6:lengthi1e4:\
+            name4:test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+    }
+
+    #[test]
+    fn parse_torrent_with_single_file_and_invalid_announce() {
+        let raw = b"d8:announce15:https//test.com4:infod6:lengthi1e4:\
+            name4:test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("announce")));
+    }
+
+    #[test]
+    fn parse_torrent_with_single_file_and_invalid_length() {
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi0e4:\
+            name4:test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.length")));
+
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi-1e4:\
+            name4:test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.length")));
+    }
+
+    #[test]
+    fn parse_torrent_with_single_file_and_invalid_name() {
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e4:\
+            name5:/test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.name")));
+    }
+
+    #[test]
+    fn parse_torrent_with_single_file_and_invalid_piece() {
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e4:\
+            name4:test5:piecei0e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.piece")));
+
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e4:\
+            name4:test5:piecei-1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.piece")));
+    }
+
+    #[test]
+    fn parse_torrent_with_single_file_and_invalid_pieces() {
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e4:\
+            name4:test5:piecei1e6:pieces14:BBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.pieces")));
+    }
+
+    #[test]
+    fn parse_torrent_with_multi_file_and_invalid_file_length() {
+        let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi0e4:\
+            pathl5:tests5:test1eed6:lengthi1e4:pathl5:tests5:test2eee4:name5:tests5:\
+            piecei2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(
+            parse(raw),
+            Err(RbitError::InvalidField("info.files.length"))
+        );
+
+        let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi1e4:\
+            pathl5:tests5:test1eed6:lengthi-1e4:pathl5:tests5:test2eee4:name5:tests5:\
+            piecei2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(
+            parse(raw),
+            Err(RbitError::InvalidField("info.files.length"))
+        );
+    }
+
+    #[test]
+    fn parse_torrent_with_multi_file_and_invalid_file_path() {
+        let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi1e4:\
+            pathl5:tests5:test1eed6:lengthi1e4:pathl6:tests_5:test2eee4:name5:tests5:\
+            piecei2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.files.path")));
+
+        let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi1e4:\
+            pathl6:/tests5:test1eed6:lengthi-1e4:pathl5:tests5:test2eee4:name5:tests5:\
+            piecei2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.files.path")));
+    }
+
+    #[test]
+    fn parse_invalid_torrent_with_single_and_multi_file() {
+        let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi1e4:\
+            pathl5:tests5:test1eed6:lengthi1e4:pathl5:tests5:test2eee6:lengthi2e4:\
+            name5:tests5:piecei2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+    }
+
+    #[test]
+    fn parse_invalid_torrent_without_file() {
+        let raw = b"d8:announce16:https://test.com4:infod4:name5:tests5:piecei2e6:\
+            pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
     }
 }
