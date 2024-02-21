@@ -1,0 +1,30 @@
+[package]
+name = "rbit"
+author = "Francisco Braço-Forte <f.s.f.b2001@gmail.com>"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_bencode = "0.2.4"
+serde_bytes = "0.11"
+anyhow = "1.0.79"
+thiserror = "1.0"
+url = "2.5"
+
+[dependencies.serde]
+version = "1"
+features = ["serde_derive"]
+
+[dependencies.tokio]
+version = "1"
+features = ["macros", "rt", "rt-multi-thread"]
+
+[dependencies.reqwest]
+version = "0.11"
+default_features = false
+features = ["rustls-tls"]
+
+[dev-dependencies]
+quickcheck = "1"
+quickcheck_macros = "1"
+claim = "0.5.0"
