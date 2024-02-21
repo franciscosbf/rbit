@@ -25,6 +25,4 @@ default_features = false
 features = ["rustls-tls"]
 
 [dev-dependencies]
-quickcheck = "1"
-quickcheck_macros = "1"
 claim = "0.5.0"
