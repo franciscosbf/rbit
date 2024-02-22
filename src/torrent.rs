@@ -1,4 +1,5 @@
 use std::{
+    ops::Deref,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -30,16 +31,28 @@ struct Metainfo {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct Piece<'a>(&'a [u8]);
+
+impl Deref for Piece<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct Pieces {
     buf: ByteBuf,
 }
 
 impl Pieces {
-    pub fn get_sha1(&self, index: usize) -> Option<&[u8]> {
+    pub fn get_sha1(&self, index: usize) -> Option<Piece> {
         let rindex = index * 20;
 
         if (0..self.buf.len()).contains(&rindex) {
-            Some(&self.buf[rindex..(rindex + 20)])
+            let sha1 = &self.buf[rindex..(rindex + 20)];
+            Some(Piece(sha1))
         } else {
             None
         }
@@ -165,7 +178,8 @@ mod tests {
     use serde_bytes::ByteBuf;
     use url::Url;
 
-    use crate::{error::RbitError, parse, FileType, Pieces};
+    use super::{parse, FileType, Piece, Pieces};
+    use crate::error::RbitError;
 
     #[test]
     fn get_pieces_chunk_wih_valid_chunk() {
@@ -173,8 +187,14 @@ mod tests {
             buf: ByteBuf::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
         };
 
-        assert_some_eq!(pieces.get_sha1(0), b"AAAAAAAAAAAAAAAAAAAA".as_slice());
-        assert_some_eq!(pieces.get_sha1(1), b"BBBBBBBBBBBBBBBBBBBB".as_slice());
+        assert_some_eq!(
+            pieces.get_sha1(0),
+            Piece(b"AAAAAAAAAAAAAAAAAAAA".as_slice())
+        );
+        assert_some_eq!(
+            pieces.get_sha1(1),
+            Piece(b"BBBBBBBBBBBBBBBBBBBB".as_slice())
+        );
     }
 
     #[test]
