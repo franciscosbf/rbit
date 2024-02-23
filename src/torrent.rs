@@ -126,6 +126,10 @@ pub fn parse(raw: &[u8]) -> Result<Torrent, RbitError> {
 
     let tracker = Url::parse(&file.announce).map_err(|_| RbitError::InvalidField("announce"))?;
 
+    if !matches!(tracker.scheme(), "https" | "http") {
+        return Err(RbitError::InvalidField("announce"));
+    }
+
     let raw_name = info.name.strip_suffix('/').unwrap_or(&info.name);
     let name = PathBuf::from_str(raw_name).map_err(|_| RbitError::InvalidField("info.name"))?;
 
@@ -250,7 +254,7 @@ mod tests {
 
     #[test]
     fn parse_valid_torrent_with_multi_file() {
-        let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi6e\
+        let raw = b"d8:announce15:http://test.com4:infod5:filesld6:lengthi6e\
             4:pathl5:tests9:test1.txteed6:lengthi7e4:pathl5:tests9:test2.txteee\
             4:name5:tests5:piecei2e6:pieces140:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
             AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA\
@@ -258,7 +262,7 @@ mod tests {
 
         let torrent = assert_ok!(parse(raw));
         let torrent = assert_ok!(parse(raw));
-        assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
+        assert_eq!(torrent.tracker, Url::parse("http://test.com").unwrap());
         assert_eq!(torrent.piece, 2);
         assert_eq!(torrent.pieces.len(), 7);
         assert_eq!(
@@ -295,6 +299,14 @@ mod tests {
             4:name4:test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+    }
+
+    #[test]
+    fn parse_torrent_with_single_file_and_unaccepted_scheme() {
+        let raw = b"d8:announce19:udp://test.com:69694:infod6:lengthi1e\
+            4:name4:test5:piecei1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("announce")));
     }
 
     #[test]
