@@ -159,7 +159,7 @@ impl TrackerClient {
 
                             Ok(SocketAddr::new(ip, port))
                         })
-                        .collect::<Result<_, RbitError>>()?,
+                        .collect::<Result<_, _>>()?,
                     PeersFormat::Compact(raw) => {
                         if raw.len() % 6 != 0 {
                             return Err(RbitError::InvalidPeers);
@@ -171,11 +171,14 @@ impl TrackerClient {
                                 let ipv4 =
                                     Ipv4Addr::new(raw[i], raw[i + 1], raw[i + 2], raw[i + 3]);
                                 let port = ((raw[i + 4] as u16) << 8) | raw[i + 5] as u16;
+                                if port == 0 {
+                                    return Err(RbitError::InvalidPeers);
+                                }
                                 let saddr_ipv4 = SocketAddrV4::new(ipv4, port);
 
-                                SocketAddr::V4(saddr_ipv4)
+                                Ok(SocketAddr::V4(saddr_ipv4))
                             })
-                            .collect()
+                            .collect::<Result<_, _>>()?
                     }
                 };
 
