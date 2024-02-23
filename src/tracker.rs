@@ -129,8 +129,8 @@ impl TrackerClient {
 
         let body = response.bytes().await.map_err(RbitError::TrackerFailed)?;
 
-        let tracker_response =
-            serde_bencode::from_bytes::<Response>(&body).map_err(|_| RbitError::InvalidPeers)?;
+        let tracker_response = serde_bencode::from_bytes::<Response>(&body)
+            .map_err(|_| RbitError::InvalidPeers("unexpected format"))?;
 
         match (tracker_response.failure, tracker_response.success) {
             (Some(error), _) => Err(RbitError::TrackerError(error)),
@@ -142,27 +142,28 @@ impl TrackerClient {
                             let port = if (1..=u16::MAX as i64).contains(&peer.port) {
                                 peer.port as u16
                             } else {
-                                return Err(RbitError::InvalidPeers);
+                                return Err(RbitError::InvalidPeers("invalid peer port"));
                             };
 
-                            let ip =
-                                match Host::parse(&peer.ip).map_err(|_| RbitError::InvalidPeers)? {
-                                    Host::Domain(domain) => (domain, 0)
-                                        .to_socket_addrs()
-                                        .map_err(|_| RbitError::InvalidPeers)?
-                                        .next()
-                                        .map(|saddr| saddr.ip())
-                                        .ok_or(RbitError::InvalidPeers)?,
-                                    Host::Ipv4(ip) => IpAddr::V4(ip),
-                                    Host::Ipv6(ip) => IpAddr::V6(ip),
-                                };
+                            let ip = match Host::parse(&peer.ip)
+                                .map_err(|_| RbitError::InvalidPeers("invalid peer ip"))?
+                            {
+                                Host::Domain(domain) => (domain, 0)
+                                    .to_socket_addrs()
+                                    .map_err(|_| RbitError::InvalidPeers("domain lookup failed"))?
+                                    .next()
+                                    .map(|saddr| saddr.ip())
+                                    .ok_or(RbitError::InvalidPeers("unknown domain ip"))?,
+                                Host::Ipv4(ip) => IpAddr::V4(ip),
+                                Host::Ipv6(ip) => IpAddr::V6(ip),
+                            };
 
                             Ok(SocketAddr::new(ip, port))
                         })
                         .collect::<Result<_, _>>()?,
                     PeersFormat::Compact(raw) => {
                         if raw.len() % 6 != 0 {
-                            return Err(RbitError::InvalidPeers);
+                            return Err(RbitError::InvalidPeers("invalid peer compact format"));
                         }
 
                         (0..raw.len())
@@ -172,7 +173,7 @@ impl TrackerClient {
                                     Ipv4Addr::new(raw[i], raw[i + 1], raw[i + 2], raw[i + 3]);
                                 let port = ((raw[i + 4] as u16) << 8) | raw[i + 5] as u16;
                                 if port == 0 {
-                                    return Err(RbitError::InvalidPeers);
+                                    return Err(RbitError::InvalidPeers("invalid peer port"));
                                 }
                                 let saddr_ipv4 = SocketAddrV4::new(ipv4, port);
 
@@ -185,12 +186,12 @@ impl TrackerClient {
                 let interval = if data.interval > 0 {
                     Duration::from_secs(data.interval as u64)
                 } else {
-                    return Err(RbitError::InvalidPeers);
+                    return Err(RbitError::InvalidPeers("invalid interval"));
                 };
 
                 Ok(Peers::new(interval, peers))
             }
-            _ => Err(RbitError::InvalidPeers),
+            _ => Err(RbitError::InvalidPeers("unexpected format")),
         }
     }
 }
