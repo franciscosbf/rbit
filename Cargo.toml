@@ -10,6 +10,7 @@ serde_bytes = "0.11"
 anyhow = "1.0.79"
 thiserror = "1.0"
 url = "2.5"
+reqwest = "0.11"
 
 [dependencies.serde]
 version = "1"
@@ -17,12 +18,11 @@ features = ["serde_derive"]
 
 [dependencies.tokio]
 version = "1"
-features = ["macros", "rt", "rt-multi-thread"]
+features = ["macros", "rt", "rt-multi-thread", "net"]
 
-[dependencies.reqwest]
-version = "0.11"
-default_features = false
-features = ["rustls-tls"]
+[dependencies.rand]
+version = "0.8.5"
+features = ["std", "std_rng"]
 
 [dev-dependencies]
 claim = "0.5.0"
