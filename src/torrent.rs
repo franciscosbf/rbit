@@ -47,6 +47,10 @@ pub struct Pieces {
 }
 
 impl Pieces {
+    fn len(&self) -> usize {
+        self.buf.len() / 20
+    }
+
     pub fn get_sha1(&self, index: usize) -> Option<Piece> {
         let rindex = index * 20;
 
@@ -158,11 +162,15 @@ pub fn parse(raw: &[u8]) -> Result<Torrent, RbitError> {
                     } else {
                         return Err(RbitError::InvalidField("info.files.length"));
                     };
+
                     let path = f.path.iter().collect::<PathBuf>();
 
                     let start = current;
                     let shift = start + (length + piece - 1) / piece;
                     let end = shift - 1;
+                    if shift as usize > pieces.len() {
+                        return Err(RbitError::InvalidField("info.pieces"));
+                    }
                     current = shift;
 
                     if path.starts_with(raw_name) {
@@ -252,6 +260,7 @@ mod tests {
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
         assert_eq!(torrent.piece, 2);
+        assert_eq!(torrent.pieces.len(), 7);
         assert_eq!(
             torrent.pieces.buf,
             ByteBuf::from(
@@ -372,6 +381,17 @@ mod tests {
             5:piecei2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(parse(raw), Err(RbitError::InvalidField("info.files.path")));
+    }
+
+    #[test]
+    fn parse_torrent_with_multi_file_and_invalid_number_of_pieces() {
+        let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi4e4:pathl\
+            5:tests9:test1.txteed6:lengthi12e4:pathl5:tests9:test2.txteee4:name5:tests\
+            5:piecei2e6:pieces140:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
+            AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA\
+            BBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAee";
+
+        assert_matches!(parse(raw), Err(RbitError::InvalidField("info.pieces")));
     }
 
     #[test]
