@@ -25,7 +25,7 @@ struct Info {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct Metainfo {
+struct MetaInfo {
     announce: String,
     info: Info,
 }
@@ -119,85 +119,94 @@ impl Torrent {
     }
 }
 
+impl TryFrom<MetaInfo> for Torrent {
+    type Error = RbitError;
+
+    fn try_from(file: MetaInfo) -> Result<Self, Self::Error> {
+        let info = file.info;
+
+        let tracker =
+            Url::parse(&file.announce).map_err(|_| RbitError::InvalidField("announce"))?;
+
+        if !matches!(tracker.scheme(), "https" | "http") {
+            return Err(RbitError::InvalidField("announce"));
+        }
+
+        let raw_name = info.name.strip_suffix('/').unwrap_or(&info.name);
+        let name = PathBuf::from_str(raw_name).map_err(|_| RbitError::InvalidField("info.name"))?;
+
+        if name.parent() != Some(Path::new("")) || name.has_root() {
+            return Err(RbitError::InvalidField("info.name"));
+        }
+
+        let piece = if info.piece > 0 {
+            info.piece as u64
+        } else {
+            return Err(RbitError::InvalidField("info.piece"));
+        };
+
+        let pieces = Pieces::try_from(info.pieces)?;
+
+        let file_type = match (info.length, info.files) {
+            (Some(length), None) => {
+                let length = if length > 0 {
+                    length as u64
+                } else {
+                    return Err(RbitError::InvalidField("info.length"));
+                };
+
+                FileType::Single { name, length }
+            }
+            (None, Some(files)) => {
+                let dir = name;
+                let mut current = 0;
+                let files = files
+                    .into_iter()
+                    .map(|f| {
+                        let length = if f.length > 0 {
+                            f.length as u64
+                        } else {
+                            return Err(RbitError::InvalidField("info.files.length"));
+                        };
+
+                        let path = f.path.iter().collect::<PathBuf>();
+
+                        let start = current;
+                        let shift = start + (length + piece - 1) / piece;
+                        let end = shift - 1;
+                        if shift as usize > pieces.len() {
+                            return Err(RbitError::InvalidField("info.pieces"));
+                        }
+                        current = shift;
+
+                        if path.starts_with(raw_name) {
+                            Ok(FileMeta::new(length, start, end, path))
+                        } else {
+                            Err(RbitError::InvalidField("info.files.path"))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                FileType::Multi { dir, files }
+            }
+            _ => return Err(RbitError::InvalidFile),
+        };
+
+        let torrent = Torrent::new(tracker, piece, pieces, file_type);
+
+        Ok(torrent)
+    }
+}
+
 pub fn parse(raw: &[u8]) -> Result<Torrent, RbitError> {
-    let file = serde_bencode::from_bytes::<Metainfo>(raw).map_err(|_| RbitError::InvalidFile)?;
-
-    let info = file.info;
-
-    let tracker = Url::parse(&file.announce).map_err(|_| RbitError::InvalidField("announce"))?;
-
-    if !matches!(tracker.scheme(), "https" | "http") {
-        return Err(RbitError::InvalidField("announce"));
-    }
-
-    let raw_name = info.name.strip_suffix('/').unwrap_or(&info.name);
-    let name = PathBuf::from_str(raw_name).map_err(|_| RbitError::InvalidField("info.name"))?;
-
-    if name.parent() != Some(Path::new("")) || name.has_root() {
-        return Err(RbitError::InvalidField("info.name"));
-    }
-
-    let piece = if info.piece > 0 {
-        info.piece as u64
-    } else {
-        return Err(RbitError::InvalidField("info.piece"));
-    };
-
-    let pieces = Pieces::try_from(info.pieces)?;
-
-    let file_type = match (info.length, info.files) {
-        (Some(length), None) => {
-            let length = if length > 0 {
-                length as u64
-            } else {
-                return Err(RbitError::InvalidField("info.length"));
-            };
-
-            FileType::Single { name, length }
-        }
-        (None, Some(files)) => {
-            let dir = name;
-            let mut current = 0;
-            let files = files
-                .into_iter()
-                .map(|f| {
-                    let length = if f.length > 0 {
-                        f.length as u64
-                    } else {
-                        return Err(RbitError::InvalidField("info.files.length"));
-                    };
-
-                    let path = f.path.iter().collect::<PathBuf>();
-
-                    let start = current;
-                    let shift = start + (length + piece - 1) / piece;
-                    let end = shift - 1;
-                    if shift as usize > pieces.len() {
-                        return Err(RbitError::InvalidField("info.pieces"));
-                    }
-                    current = shift;
-
-                    if path.starts_with(raw_name) {
-                        Ok(FileMeta::new(length, start, end, path))
-                    } else {
-                        Err(RbitError::InvalidField("info.files.path"))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            FileType::Multi { dir, files }
-        }
-        _ => return Err(RbitError::InvalidFile),
-    };
-
-    let torrent = Torrent::new(tracker, piece, pieces, file_type);
-
-    Ok(torrent)
+    serde_bencode::from_bytes::<MetaInfo>(raw)
+        .map_err(|_| RbitError::InvalidFile)?
+        .try_into()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use claim::{assert_matches, assert_none, assert_ok, assert_some_eq};
     use serde_bytes::ByteBuf;
@@ -260,7 +269,6 @@ mod tests {
             AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA\
             BBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAee";
 
-        let torrent = assert_ok!(parse(raw));
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("http://test.com").unwrap());
         assert_eq!(torrent.piece, 2);
