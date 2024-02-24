@@ -60,7 +60,7 @@ pub enum Event {
 }
 
 impl Event {
-    fn to_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         match self {
             Event::Started => "started",
             Event::Completed => "completed",
@@ -201,12 +201,15 @@ impl TrackerClient {
     ) -> Self {
         let http_client = reqwest::Client::builder().timeout(timeout).build().unwrap();
 
+        let port = listening_port.to_string();
+        let peer_id = encode_query_value(&peer_id);
+
         base_tracker_url
             .query_pairs_mut()
             .clear()
             .append_pair("compat", "1")
-            .append_pair("port", &listening_port.to_string())
-            .append_pair("peer_id", &encode_query_value(&peer_id));
+            .append_pair("port", &port)
+            .append_pair("peer_id", &peer_id);
 
         Self {
             http_client,
@@ -222,14 +225,16 @@ impl TrackerClient {
         left: usize,
         event: Event,
     ) -> Result<Peers, RbitError> {
+        let info_hash = encode_query_value(&info_hash);
+
         let response = self
             .http_client
             .get(self.base_tracker_url.as_str())
-            .query(&[("info_hash", &encode_query_value(&info_hash))])
+            .query(&[("info_hash", &info_hash)])
             .query(&[("uploaded", uploaded)])
             .query(&[("downloaded", downloaded)])
             .query(&[("left", left)])
-            .query(&[("event", event.to_str())])
+            .query(&[("event", event.as_str())])
             .send()
             .await
             .map_err(RbitError::TrackerFailed)?;
