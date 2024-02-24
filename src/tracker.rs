@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
+    ops::Deref,
     time::Duration,
 };
 
@@ -7,6 +8,23 @@ use serde_bytes::ByteBuf;
 use url::{Host, Url};
 
 use crate::{error::RbitError, PeerId, Piece};
+
+fn encode_query_value(bts: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bts.len());
+
+    bts.iter().for_each(|&b| {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~') {
+            encoded.push(b as char);
+        } else {
+            const HEX: &[u8] = b"0123456789ABCDEF";
+            encoded.push('%');
+            encoded.push(HEX[(b as usize) >> 4 & 0xF] as char);
+            encoded.push(HEX[(b as usize) & 0xF] as char);
+        }
+    });
+
+    encoded
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct Peer {
@@ -28,27 +46,10 @@ struct Success {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct Response {
+struct TrackerResponse {
     failure: Option<String>,
     #[serde(flatten)]
     success: Option<Success>,
-}
-
-fn encode_query_value(bts: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bts.len());
-
-    bts.iter().for_each(|&b| {
-        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~') {
-            encoded.push(b as char);
-        } else {
-            const HEX: &[u8] = b"0123456789ABCDEF";
-            encoded.push('%');
-            encoded.push(HEX[(b as usize) >> 4 & 0xF] as char);
-            encoded.push(HEX[(b as usize) & 0xF] as char);
-        }
-    });
-
-    encoded
 }
 
 pub enum Event {
@@ -69,14 +70,120 @@ impl Event {
     }
 }
 
+pub struct Interval(Duration);
+
+impl Deref for Interval {
+    type Target = Duration;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TryFrom<i64> for Interval {
+    type Error = RbitError;
+
+    fn try_from(raw: i64) -> Result<Self, Self::Error> {
+        if raw >= 0 {
+            Ok(Interval(Duration::from_secs(raw as u64)))
+        } else {
+            Err(RbitError::InvalidPeers("invalid interval"))
+        }
+    }
+}
+
+pub struct PeerAddr(SocketAddr);
+
+impl From<SocketAddr> for PeerAddr {
+    fn from(value: SocketAddr) -> Self {
+        PeerAddr(value)
+    }
+}
+
+impl Deref for PeerAddr {
+    type Target = SocketAddr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TryFrom<Peer> for PeerAddr {
+    type Error = RbitError;
+
+    fn try_from(peer: Peer) -> Result<Self, Self::Error> {
+        let port = peer.port as u16;
+        let ip =
+            match Host::parse(&peer.ip).map_err(|_| RbitError::InvalidPeers("invalid peer ip"))? {
+                Host::Domain(domain) => (domain, 0)
+                    .to_socket_addrs()
+                    .map_err(|_| RbitError::InvalidPeers("domain lookup failed"))?
+                    .next()
+                    .map(|saddr| saddr.ip())
+                    .ok_or(RbitError::InvalidPeers("unknown domain ip"))?,
+                Host::Ipv4(ip) => IpAddr::V4(ip),
+                Host::Ipv6(ip) => IpAddr::V6(ip),
+            };
+
+        Ok(SocketAddr::new(ip, port).into())
+    }
+}
+
+impl TryFrom<&[u8]> for PeerAddr {
+    type Error = RbitError;
+
+    fn try_from(raw: &[u8]) -> Result<Self, Self::Error> {
+        let ipv4 = Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]);
+        let port = ((raw[4] as u16) << 8) | raw[5] as u16;
+        let saddr_ipv4 = SocketAddrV4::new(ipv4, port);
+
+        Ok(SocketAddr::V4(saddr_ipv4).into())
+    }
+}
+
 pub struct Peers {
-    pub interval: Duration,
-    pub peers: Vec<SocketAddr>,
+    pub interval: Interval,
+    pub peers: Vec<PeerAddr>,
 }
 
 impl Peers {
-    fn new(interval: Duration, peers: Vec<SocketAddr>) -> Self {
+    fn new(interval: Interval, peers: Vec<PeerAddr>) -> Self {
         Self { interval, peers }
+    }
+}
+
+impl TryFrom<TrackerResponse> for Peers {
+    type Error = RbitError;
+
+    fn try_from(response: TrackerResponse) -> Result<Self, Self::Error> {
+        match (response.failure, response.success) {
+            (Some(error), _) => Err(RbitError::TrackerError(error)),
+            (None, Some(msg)) => {
+                let interval = msg.interval.try_into()?;
+
+                let peers = match msg.peers {
+                    PeersFormat::Simple(ready) => ready
+                        .into_iter()
+                        .map(|peer| peer.try_into())
+                        .collect::<Result<_, RbitError>>()?,
+                    PeersFormat::Compact(raw) => {
+                        const CPEER_SZ: usize = 6;
+
+                        if raw.len() % CPEER_SZ != 0 {
+                            return Err(RbitError::InvalidPeers("invalid peer compact format"));
+                        }
+
+                        (0..raw.len())
+                            .step_by(CPEER_SZ)
+                            .map(|i| (&raw[i..i + CPEER_SZ]).try_into())
+                            .collect::<Result<_, RbitError>>()?
+                    }
+                };
+
+                Ok(Peers::new(interval, peers))
+            }
+            _ => Err(RbitError::InvalidPeers("unexpected format")),
+        }
     }
 }
 
@@ -129,70 +236,9 @@ impl TrackerClient {
 
         let body = response.bytes().await.map_err(RbitError::TrackerFailed)?;
 
-        let tracker_response = serde_bencode::from_bytes::<Response>(&body)
-            .map_err(|_| RbitError::InvalidPeers("unexpected format"))?;
-
-        match (tracker_response.failure, tracker_response.success) {
-            (Some(error), _) => Err(RbitError::TrackerError(error)),
-            (None, Some(data)) => {
-                let peers = match data.peers {
-                    PeersFormat::Simple(ready) => ready
-                        .iter()
-                        .map(|peer| {
-                            let port = if (1..=u16::MAX as i64).contains(&peer.port) {
-                                peer.port as u16
-                            } else {
-                                return Err(RbitError::InvalidPeers("invalid peer port"));
-                            };
-
-                            let ip = match Host::parse(&peer.ip)
-                                .map_err(|_| RbitError::InvalidPeers("invalid peer ip"))?
-                            {
-                                Host::Domain(domain) => (domain, 0)
-                                    .to_socket_addrs()
-                                    .map_err(|_| RbitError::InvalidPeers("domain lookup failed"))?
-                                    .next()
-                                    .map(|saddr| saddr.ip())
-                                    .ok_or(RbitError::InvalidPeers("unknown domain ip"))?,
-                                Host::Ipv4(ip) => IpAddr::V4(ip),
-                                Host::Ipv6(ip) => IpAddr::V6(ip),
-                            };
-
-                            Ok(SocketAddr::new(ip, port))
-                        })
-                        .collect::<Result<_, _>>()?,
-                    PeersFormat::Compact(raw) => {
-                        if raw.len() % 6 != 0 {
-                            return Err(RbitError::InvalidPeers("invalid peer compact format"));
-                        }
-
-                        (0..raw.len())
-                            .step_by(6)
-                            .map(|i| {
-                                let ipv4 =
-                                    Ipv4Addr::new(raw[i], raw[i + 1], raw[i + 2], raw[i + 3]);
-                                let port = ((raw[i + 4] as u16) << 8) | raw[i + 5] as u16;
-                                if port == 0 {
-                                    return Err(RbitError::InvalidPeers("invalid peer port"));
-                                }
-                                let saddr_ipv4 = SocketAddrV4::new(ipv4, port);
-
-                                Ok(SocketAddr::V4(saddr_ipv4))
-                            })
-                            .collect::<Result<_, _>>()?
-                    }
-                };
-
-                let interval = if data.interval > 0 {
-                    Duration::from_secs(data.interval as u64)
-                } else {
-                    return Err(RbitError::InvalidPeers("invalid interval"));
-                };
-
-                Ok(Peers::new(interval, peers))
-            }
-            _ => Err(RbitError::InvalidPeers("unexpected format")),
-        }
+        serde_bencode::from_bytes::<TrackerResponse>(&body)
+            .map_err(|_| RbitError::InvalidPeers("unexpected format"))?
+            .try_into()
     }
 }
 
