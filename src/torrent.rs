@@ -208,7 +208,7 @@ pub fn parse(raw: &[u8]) -> Result<Torrent, RbitError> {
 mod tests {
     use std::path::Path;
 
-    use claim::{assert_matches, assert_none, assert_ok, assert_some_eq};
+    use claims::{assert_matches, assert_none, assert_ok, assert_some_eq};
     use serde_bytes::ByteBuf;
     use url::Url;
 
