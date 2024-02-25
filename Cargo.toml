@@ -1,6 +1,6 @@
 [package]
 name = "rbit"
-author = "Francisco Braço-Forte <f.s.f.b2001@gmail.com>"
+authors = ["Francisco Braço-Forte <f.s.f.b2001@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
 
@@ -26,3 +26,4 @@ features = ["std", "std_rng"]
 
 [dev-dependencies]
 claims = "0.7.1"
+wiremock = "0.6.0"
