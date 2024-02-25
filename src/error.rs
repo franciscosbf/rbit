@@ -11,5 +11,5 @@ pub enum RbitError {
     #[error("Invalid peers data: {0}")]
     InvalidPeers(&'static str),
     #[error("Tracker returned an error: {0}")]
-    TrackerError(String),
+    TrackerErrorResponse(String),
 }

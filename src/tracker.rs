@@ -70,6 +70,7 @@ impl Event {
     }
 }
 
+#[derive(Debug)]
 pub struct Interval(Duration);
 
 impl Deref for Interval {
@@ -92,6 +93,7 @@ impl TryFrom<i64> for Interval {
     }
 }
 
+#[derive(Debug)]
 pub struct PeerAddr(SocketAddr);
 
 impl From<SocketAddr> for PeerAddr {
@@ -134,21 +136,25 @@ impl TryFrom<&[u8]> for PeerAddr {
 
     fn try_from(raw: &[u8]) -> Result<Self, Self::Error> {
         let ipv4 = Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]);
-        let port = ((raw[4] as u16) << 8) | raw[5] as u16;
+        let port = u16::from_be_bytes([raw[4], raw[5]]);
         let saddr_ipv4 = SocketAddrV4::new(ipv4, port);
 
         Ok(SocketAddr::V4(saddr_ipv4).into())
     }
 }
 
+#[derive(Debug)]
 pub struct Peers {
     pub interval: Interval,
-    pub peers: Vec<PeerAddr>,
+    pub addresses: Vec<PeerAddr>,
 }
 
 impl Peers {
-    fn new(interval: Interval, peers: Vec<PeerAddr>) -> Self {
-        Self { interval, peers }
+    fn new(interval: Interval, addresses: Vec<PeerAddr>) -> Self {
+        Self {
+            interval,
+            addresses,
+        }
     }
 }
 
@@ -157,11 +163,11 @@ impl TryFrom<TrackerResponse> for Peers {
 
     fn try_from(response: TrackerResponse) -> Result<Self, Self::Error> {
         match (response.failure, response.success) {
-            (Some(error), _) => Err(RbitError::TrackerError(error)),
+            (Some(error), _) => Err(RbitError::TrackerErrorResponse(error)),
             (None, Some(msg)) => {
                 let interval = msg.interval.try_into()?;
 
-                let peers = match msg.peers {
+                let addresses = match msg.peers {
                     PeersFormat::Simple(ready) => ready
                         .into_iter()
                         .map(|peer| peer.try_into())
@@ -170,7 +176,7 @@ impl TryFrom<TrackerResponse> for Peers {
                         const CPEER_SZ: usize = 6;
 
                         if raw.len() % CPEER_SZ != 0 {
-                            return Err(RbitError::InvalidPeers("invalid peer compact format"));
+                            return Err(RbitError::InvalidPeers("invalid peers compact format"));
                         }
 
                         (0..raw.len())
@@ -180,7 +186,7 @@ impl TryFrom<TrackerResponse> for Peers {
                     }
                 };
 
-                Ok(Peers::new(interval, peers))
+                Ok(Peers::new(interval, addresses))
             }
             _ => Err(RbitError::InvalidPeers("unexpected format")),
         }
@@ -196,13 +202,13 @@ impl TrackerClient {
     pub fn new(
         mut base_tracker_url: Url,
         listening_port: u16,
-        peer_id: PeerId,
+        peer_id: &PeerId,
         timeout: Duration,
     ) -> Self {
         let http_client = reqwest::Client::builder().timeout(timeout).build().unwrap();
 
         let port = listening_port.to_string();
-        let peer_id = encode_query_value(&peer_id);
+        let peer_id = encode_query_value(peer_id);
 
         base_tracker_url
             .query_pairs_mut()
@@ -249,7 +255,17 @@ impl TrackerClient {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_query_value;
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        time::Duration,
+    };
+
+    use claims::{assert_matches, assert_ok};
+    use serde_bytes::ByteBuf;
+
+    use crate::{error::RbitError, PeerAddr};
+
+    use super::{encode_query_value, Interval, Peer, Peers, PeersFormat, Success, TrackerResponse};
 
     #[test]
     fn encode_piece_sha1() {
@@ -266,5 +282,190 @@ mod tests {
         let normal_chars = &[b'a', b'Z', b'1', b'.', b'-', b'_', b'~'];
 
         assert_eq!("aZ1.-_~", encode_query_value(normal_chars));
+    }
+
+    #[test]
+    fn parse_valid_interval() {
+        let interval: Interval = assert_ok!(1_i64.try_into());
+
+        assert_eq!(*interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn parse_invalid_interval() {
+        assert_matches!(
+            <i64 as TryInto<Interval>>::try_into(-1 as i64),
+            Err(RbitError::InvalidPeers("invalid interval"))
+        );
+    }
+
+    #[test]
+    fn convert_valid_peer_to_peer_addr() {
+        let paddr: PeerAddr = assert_ok!(Peer {
+            ip: "192.145.124.34".into(),
+            port: 45,
+        }
+        .try_into());
+
+        assert_eq!(
+            *paddr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 145, 124, 34)), 45)
+        );
+
+        let paddr: PeerAddr = assert_ok!(Peer {
+            ip: "[0:0:0:0:0:ffff:c00a:2ff]".into(),
+            port: 45,
+        }
+        .try_into());
+
+        assert_eq!(
+            *paddr,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc00a, 0x2ff)),
+                45
+            )
+        );
+
+        assert_ok!(<Peer as TryInto<PeerAddr>>::try_into(Peer {
+            ip: "localhost".into(),
+            port: 45,
+        }));
+    }
+
+    #[test]
+    fn convert_invalid_peer_to_peer_addr() {
+        assert_matches!(
+            <Peer as TryInto<PeerAddr>>::try_into(Peer {
+                ip: "192.145.--.34".into(),
+                port: 45,
+            }),
+            Err(RbitError::InvalidPeers("invalid peer ip"))
+        );
+
+        assert_matches!(
+            <Peer as TryInto<PeerAddr>>::try_into(Peer {
+                ip: "[0:0:0:00:ffff:c00a:2ff]".into(),
+                port: 45,
+            }),
+            Err(RbitError::InvalidPeers("invalid peer ip"))
+        );
+
+        assert_matches!(
+            <Peer as TryInto<PeerAddr>>::try_into(Peer {
+                ip: "localhost.invalid".into(),
+                port: 45,
+            }),
+            Err(RbitError::InvalidPeers("domain lookup failed"))
+        );
+
+        // WARN: idk how to test domain resolution result without returned ips.
+    }
+
+    #[test]
+    fn convert_byte_slice_to_peer_addr() {
+        let paddr: PeerAddr = assert_ok!((&[192_u8, 145, 21, 34, 0, 45][..]).try_into());
+
+        assert_eq!(
+            *paddr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 145, 21, 34)), 45)
+        );
+    }
+
+    #[test]
+    fn convert_valid_tracker_response_with_simple_peers_format_to_peers() {
+        let tracker_response = TrackerResponse {
+            failure: None,
+            success: Some(Success {
+                interval: 2,
+                peers: PeersFormat::Simple(vec![
+                    Peer {
+                        ip: "192.145.124.34".into(),
+                        port: 45,
+                    },
+                    Peer {
+                        ip: "[0:0:0:0:0:ffff:c00a:2ff]".into(),
+                        port: 124,
+                    },
+                ]),
+            }),
+        };
+
+        let peers: Peers = assert_ok!(tracker_response.try_into());
+        assert_eq!(*peers.interval, Duration::from_secs(2));
+        assert_eq!(peers.addresses.len(), 2);
+        assert_eq!(
+            *peers.addresses[0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 145, 124, 34)), 45)
+        );
+        assert_eq!(
+            *peers.addresses[1],
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc00a, 0x2ff)),
+                124
+            )
+        );
+    }
+
+    #[test]
+    fn convert_valid_tracker_response_with_compact_peers_format_to_peers() {
+        let tracker_response = TrackerResponse {
+            failure: None,
+            success: Some(Success {
+                interval: 2,
+                peers: PeersFormat::Compact(ByteBuf::from::<&[u8]>(&[
+                    192, 145, 21, 34, 0, 45, 54, 225, 23, 1, 17, 82,
+                ])),
+            }),
+        };
+
+        let peers: Peers = assert_ok!(tracker_response.try_into());
+        assert_eq!(*peers.interval, Duration::from_secs(2));
+        assert_eq!(peers.addresses.len(), 2);
+        assert_eq!(
+            *peers.addresses[0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 145, 21, 34)), 45)
+        );
+        assert_eq!(
+            *peers.addresses[1],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(54, 225, 23, 1)), 4434)
+        );
+    }
+
+    #[test]
+    fn convert_valid_tracker_response_with_error_message() {
+        let _error = RbitError::TrackerErrorResponse("test".into());
+
+        assert_matches!(
+            <TrackerResponse as TryInto<Peers>>::try_into(TrackerResponse {
+                failure: Some("test".into()),
+                success: None,
+            }),
+            Err(_error)
+        );
+    }
+
+    #[test]
+    fn convert_invalid_tracker_response_format() {
+        assert_matches!(
+            <TrackerResponse as TryInto<Peers>>::try_into(TrackerResponse {
+                failure: None,
+                success: None,
+            }),
+            Err(RbitError::InvalidPeers("unexpected format"))
+        );
+    }
+
+    #[test]
+    fn convert_invalid_tracker_response_with_invalid_peers_compat_format() {
+        assert_matches!(
+            <TrackerResponse as TryInto<Peers>>::try_into(TrackerResponse {
+                failure: None,
+                success: Some(Success {
+                    interval: 2,
+                    peers: PeersFormat::Compact(ByteBuf::from::<&[u8]>(&[192, 145, 21, 34, 0])),
+                }),
+            }),
+            Err(RbitError::InvalidPeers("invalid peers compact format"))
+        );
     }
 }
