@@ -42,11 +42,7 @@ impl FromBencode for File {
                         .context("path")?
                         .into();
                 }
-                (unknown_field, _) => {
-                    return Err(Error::unexpected_field(String::from_utf8_lossy(
-                        unknown_field,
-                    )));
-                }
+                _ => (),
             }
         }
 
@@ -111,11 +107,7 @@ impl FromBencode for Info {
 
                     files = files_info.into();
                 }
-                (unknown_field, _) => {
-                    return Err(Error::unexpected_field(String::from_utf8_lossy(
-                        unknown_field,
-                    )));
-                }
+                _ => (),
             }
         }
 
@@ -169,11 +161,7 @@ impl FromBencode for MetaInfo {
                         .map(|info| (info, raw_info.to_vec()))
                         .map(Some)?;
                 }
-                (unknown_field, _) => {
-                    return Err(Error::unexpected_field(String::from_utf8_lossy(
-                        unknown_field,
-                    )));
-                }
+                _ => (),
             }
         }
 
