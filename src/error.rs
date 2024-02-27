@@ -5,7 +5,7 @@ pub enum RbitError {
     #[error("Invalid Torrent file")]
     InvalidFile,
     #[error("Invalid value of field `{0}`")]
-    InvalidField(&'static str),
+    InvalidFieldValue(&'static str),
     #[error("Error trying get peers: {0}")]
     TrackerFailed(#[from] reqwest::Error),
     #[error("Invalid peers data: {0}")]

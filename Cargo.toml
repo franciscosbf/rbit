@@ -5,12 +5,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bendy = "0.3.3"
 serde_bencode = "0.2.4"
 serde_bytes = "0.11"
 anyhow = "1.0.79"
 thiserror = "1.0"
 url = "2.5"
 reqwest = "0.11"
+sha1 = "0.10.6"
 
 [dependencies.serde]
 version = "1"
