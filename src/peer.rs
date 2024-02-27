@@ -1,7 +1,6 @@
 use std::ops::Deref;
 
-#[derive(Clone, Copy)]
-pub struct PeerId([u8; 20]);
+pub struct PeerId(pub [u8; 20]);
 
 impl PeerId {
     pub fn build() -> Self {
