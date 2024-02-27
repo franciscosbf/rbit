@@ -5,7 +5,6 @@ use std::{
 };
 
 use bendy::decoding::{Decoder, Error, FromBencode, Object, ResultExt};
-use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
 use url::Url;
 
@@ -57,7 +56,7 @@ impl FromBencode for File {
 struct Info {
     name: String,
     piece_length: u64,
-    pieces: ByteBuf,
+    pieces: Vec<u8>,
     length: Option<u64>,
     files: Option<Vec<File>>,
 }
@@ -94,9 +93,7 @@ impl FromBencode for Info {
                         .map(Some)
                         .map_err(Error::malformed_content)?;
                 }
-                (b"pieces", value) => {
-                    pieces = value.try_into_bytes().map(ByteBuf::from).map(Some)?
-                }
+                (b"pieces", value) => pieces = value.try_into_bytes().map(Vec::from).map(Some)?,
                 (b"files", value) => {
                     let mut files_info = vec![];
 
@@ -177,7 +174,7 @@ impl FromBencode for MetaInfo {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Piece<'a>(&'a [u8]);
+pub struct Piece<'a>(pub &'a [u8]);
 
 impl Deref for Piece<'_> {
     type Target = [u8];
@@ -189,7 +186,7 @@ impl Deref for Piece<'_> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Pieces {
-    buf: ByteBuf,
+    buf: Vec<u8>,
 }
 
 impl Pieces {
@@ -209,10 +206,10 @@ impl Pieces {
     }
 }
 
-impl TryFrom<ByteBuf> for Pieces {
+impl TryFrom<Vec<u8>> for Pieces {
     type Error = RbitError;
 
-    fn try_from(pieces: ByteBuf) -> Result<Self, Self::Error> {
+    fn try_from(pieces: Vec<u8>) -> Result<Self, Self::Error> {
         if !pieces.is_empty() && pieces.len() % 20 == 0 {
             Ok(Pieces { buf: pieces })
         } else {
@@ -222,7 +219,7 @@ impl TryFrom<ByteBuf> for Pieces {
 }
 
 #[derive(Debug)]
-pub struct InfoHash([u8; 20]);
+pub struct InfoHash(pub [u8; 20]);
 
 impl From<&[u8]> for InfoHash {
     fn from(raw_info: &[u8]) -> Self {
@@ -397,7 +394,6 @@ mod tests {
     use std::path::Path;
 
     use claims::{assert_matches, assert_none, assert_ok, assert_some_eq};
-    use serde_bytes::ByteBuf;
     use url::Url;
 
     use super::{parse, FileType, Piece, Pieces};
@@ -406,7 +402,7 @@ mod tests {
     #[test]
     fn get_pieces_chunk_wih_valid_chunk() {
         let pieces = Pieces {
-            buf: ByteBuf::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
+            buf: Vec::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
         };
 
         assert_some_eq!(
@@ -422,7 +418,7 @@ mod tests {
     #[test]
     fn get_pieces_chunk_wih_invalid_chunk() {
         let pieces = Pieces {
-            buf: ByteBuf::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
+            buf: Vec::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
         };
 
         assert_none!(pieces.get_sha1(2));
@@ -436,10 +432,7 @@ mod tests {
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
         assert_eq!(torrent.piece, 1);
-        assert_eq!(
-            torrent.pieces.buf,
-            ByteBuf::from(b"BBBBBBBBBBBBBBBBBBBB".as_slice())
-        );
+        assert_eq!(torrent.pieces.buf, b"BBBBBBBBBBBBBBBBBBBB".as_slice());
         assert_eq!(torrent.length, 1);
         match torrent.file_type {
             FileType::Single { name } => {
@@ -464,12 +457,10 @@ mod tests {
         assert_eq!(torrent.length, 13);
         assert_eq!(
             torrent.pieces.buf,
-            ByteBuf::from(
-                b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
+            b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
                 AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
                 AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA"
-                    .as_slice()
-            )
+                .as_slice()
         );
         match torrent.file_type {
             FileType::Multi { dir, files } => {
