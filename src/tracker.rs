@@ -1,55 +1,154 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
     ops::Deref,
+    str::FromStr,
     time::Duration,
 };
 
-use serde_bytes::ByteBuf;
+use bendy::decoding::{Error, FromBencode, Object};
 use url::{Host, Url};
 
-use crate::{error::RbitError, PeerId, Piece};
+use crate::{error::RbitError, InfoHash, PeerId};
 
-fn encode_query_value(bts: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bts.len());
-
-    bts.iter().for_each(|&b| {
-        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~') {
-            encoded.push(b as char);
-        } else {
-            const HEX: &[u8] = b"0123456789ABCDEF";
-            encoded.push('%');
-            encoded.push(HEX[(b as usize) >> 4 & 0xF] as char);
-            encoded.push(HEX[(b as usize) & 0xF] as char);
-        }
-    });
-
-    encoded
+fn bytes_to_str(raw: &[u8]) -> &str {
+    unsafe { std::str::from_utf8_unchecked(raw) }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug)]
 struct Peer {
     ip: String,
-    port: i64,
+    port: u16,
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(untagged)]
+impl FromBencode for Peer {
+    const EXPECTED_RECURSION_DEPTH: usize = 1;
+
+    fn decode_bencode_object(object: Object) -> Result<Self, Error>
+    where
+        Self: Sized,
+    {
+        let mut ip = None;
+        let mut port = None;
+
+        let mut dict = object.try_into_dictionary()?;
+        while let Some(pair) = dict.next_pair()? {
+            match pair {
+                (b"ip", value) => {
+                    ip = String::decode_bencode_object(value).map(Some)?;
+                }
+                (b"port", value) => {
+                    let raw_port = value.try_into_integer()?;
+
+                    port = u16::from_str(raw_port)
+                        .map(Some)
+                        .map_err(Error::malformed_content)?;
+                }
+                _ => (),
+            }
+        }
+
+        let ip = ip.ok_or_else(|| Error::missing_field("ip"))?;
+        let port = port.ok_or_else(|| Error::missing_field("port"))?;
+
+        Ok(Peer { ip, port })
+    }
+}
+
+#[derive(Debug)]
 enum PeersFormat {
     Simple(Vec<Peer>),
-    Compact(ByteBuf),
+    Compact(Vec<u8>),
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug)]
 struct Success {
-    interval: i64,
+    interval: u64,
     peers: PeersFormat,
 }
 
-#[derive(Debug, serde::Deserialize)]
+impl FromBencode for Success {
+    const EXPECTED_RECURSION_DEPTH: usize = Peer::EXPECTED_RECURSION_DEPTH + 1;
+
+    fn decode_bencode_object(object: Object) -> Result<Self, Error>
+    where
+        Self: Sized,
+    {
+        let mut interval = None;
+        let mut peers = None;
+
+        let mut dict = object.try_into_dictionary()?;
+        while let Some(pair) = dict.next_pair()? {
+            match pair {
+                (b"interval", value) => {
+                    let raw_interval = value.try_into_integer()?;
+
+                    interval = u64::from_str(raw_interval)
+                        .map(Some)
+                        .map_err(Error::malformed_content)?;
+                }
+                (b"peers", value) => {
+                    peers = match value {
+                        Object::List(mut peers_list) => {
+                            let mut tmp_peers = vec![];
+
+                            while let Some(peer_obj) = peers_list.next_object()? {
+                                tmp_peers.push(Peer::decode_bencode_object(peer_obj)?);
+                            }
+
+                            PeersFormat::Simple(tmp_peers)
+                        }
+                        Object::Bytes(peers_list) => PeersFormat::Compact(Vec::from(peers_list)),
+                        unknown => {
+                            return Err(Error::unexpected_token(
+                                "Unknown",
+                                unknown.into_token().name(),
+                            ))
+                        }
+                    }
+                    .into();
+                }
+                _ => (),
+            }
+        }
+
+        let interval = interval.ok_or_else(|| Error::missing_field("interval"))?;
+        let peers = peers.ok_or_else(|| Error::missing_field("peers"))?;
+
+        Ok(Success { interval, peers })
+    }
+}
+
+#[derive(Debug)]
 struct TrackerResponse {
     failure: Option<String>,
-    #[serde(flatten)]
     success: Option<Success>,
+}
+
+impl FromBencode for TrackerResponse {
+    const EXPECTED_RECURSION_DEPTH: usize = Success::EXPECTED_RECURSION_DEPTH + 1;
+
+    fn decode_bencode_object(object: Object) -> Result<Self, Error>
+    where
+        Self: Sized,
+    {
+        let mut failure = None;
+        let mut success = None;
+
+        let mut dict = object.try_into_dictionary()?;
+        while let Some(pair) = dict.next_pair()? {
+            match pair {
+                (b"failure reason", value) => {
+                    failure = String::decode_bencode_object(value).map(Some)?;
+                }
+                (b"success", value) => {
+                    success = Success::decode_bencode_object(value).map(Some)?;
+                }
+                _ => (),
+            }
+        }
+
+        Ok(TrackerResponse { failure, success })
+    }
 }
 
 pub enum Event {
@@ -71,7 +170,7 @@ impl Event {
 }
 
 #[derive(Debug)]
-pub struct Interval(Duration);
+pub struct Interval(pub Duration);
 
 impl Deref for Interval {
     type Target = Duration;
@@ -81,15 +180,9 @@ impl Deref for Interval {
     }
 }
 
-impl TryFrom<i64> for Interval {
-    type Error = RbitError;
-
-    fn try_from(raw: i64) -> Result<Self, Self::Error> {
-        if raw >= 0 {
-            Ok(Interval(Duration::from_secs(raw as u64)))
-        } else {
-            Err(RbitError::InvalidPeers("invalid interval"))
-        }
+impl From<u64> for Interval {
+    fn from(raw: u64) -> Self {
+        Interval(Duration::from_secs(raw))
     }
 }
 
@@ -114,7 +207,7 @@ impl TryFrom<Peer> for PeerAddr {
     type Error = RbitError;
 
     fn try_from(peer: Peer) -> Result<Self, Self::Error> {
-        let port = peer.port as u16;
+        let port = peer.port;
         let ip =
             match Host::parse(&peer.ip).map_err(|_| RbitError::InvalidPeers("invalid peer ip"))? {
                 Host::Domain(domain) => (domain, 0)
@@ -165,7 +258,7 @@ impl TryFrom<TrackerResponse> for Peers {
         match (response.failure, response.success) {
             (Some(error), _) => Err(RbitError::TrackerErrorResponse(error)),
             (None, Some(msg)) => {
-                let interval = msg.interval.try_into()?;
+                let interval = msg.interval.into();
 
                 let addresses = match msg.peers {
                     PeersFormat::Simple(ready) => ready
@@ -201,21 +294,17 @@ pub struct TrackerClient {
 impl TrackerClient {
     pub fn new(
         mut base_tracker_url: Url,
-        listening_port: u16,
+        info_hash: &InfoHash,
         peer_id: &PeerId,
         timeout: Duration,
     ) -> Self {
         let http_client = reqwest::Client::builder().timeout(timeout).build().unwrap();
 
-        let port = listening_port.to_string();
-        let peer_id = encode_query_value(peer_id);
-
         base_tracker_url
             .query_pairs_mut()
-            .clear()
-            .append_pair("compat", "1")
-            .append_pair("port", &port)
-            .append_pair("peer_id", &peer_id);
+            .append_pair("info_hash", bytes_to_str(&info_hash[..]))
+            .append_pair("peer_id", bytes_to_str(peer_id))
+            .append_pair("compact", "1");
 
         Self {
             http_client,
@@ -225,30 +314,31 @@ impl TrackerClient {
 
     pub async fn fetch_peers(
         &self,
-        info_hash: Piece<'_>,
+        listening_port: u16,
         uploaded: usize,
         downloaded: usize,
         left: usize,
         event: Event,
     ) -> Result<Peers, RbitError> {
-        let info_hash = encode_query_value(&info_hash);
-
-        let response = self
+        let body = self
             .http_client
             .get(self.base_tracker_url.as_str())
-            .query(&[("info_hash", &info_hash)])
+            .query(&[("port", listening_port.to_string())])
             .query(&[("uploaded", uploaded)])
             .query(&[("downloaded", downloaded)])
             .query(&[("left", left)])
             .query(&[("event", event.as_str())])
             .send()
             .await
+            .map_err(RbitError::TrackerFailed)?
+            .error_for_status()
+            .map_err(RbitError::TrackerFailed)?
+            .bytes()
+            .await
             .map_err(RbitError::TrackerFailed)?;
 
-        let body = response.bytes().await.map_err(RbitError::TrackerFailed)?;
-
-        serde_bencode::from_bytes::<TrackerResponse>(&body)
-            .map_err(|_| RbitError::InvalidPeers("unexpected format"))?
+        TrackerResponse::from_bencode(&body)
+            .map_err(|_| RbitError::InvalidTrackerResponse)?
             .try_into()
     }
 }
@@ -261,42 +351,16 @@ mod tests {
     };
 
     use claims::{assert_matches, assert_ok};
-    use serde_bytes::ByteBuf;
 
     use crate::{error::RbitError, PeerAddr};
 
-    use super::{encode_query_value, Interval, Peer, Peers, PeersFormat, Success, TrackerResponse};
-
-    #[test]
-    fn encode_piece_sha1() {
-        let sha1 = &[
-            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF1, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
-            0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A,
-        ];
-
-        assert_eq!(
-            "%124Vx%9A%BC%DE%F1%23Eg%89%AB%CD%EF%124Vx%9A",
-            encode_query_value(sha1)
-        );
-
-        let normal_chars = &[b'a', b'Z', b'1', b'.', b'-', b'_', b'~'];
-
-        assert_eq!("aZ1.-_~", encode_query_value(normal_chars));
-    }
+    use super::{Interval, Peer, Peers, PeersFormat, Success, TrackerResponse};
 
     #[test]
     fn parse_valid_interval() {
-        let interval: Interval = assert_ok!(1_i64.try_into());
+        let interval: Interval = assert_ok!(1_u64.try_into());
 
         assert_eq!(*interval, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn parse_invalid_interval() {
-        assert_matches!(
-            <i64 as TryInto<Interval>>::try_into(-1 as i64),
-            Err(RbitError::InvalidPeers("invalid interval"))
-        );
     }
 
     #[test]
@@ -412,9 +476,9 @@ mod tests {
             failure: None,
             success: Some(Success {
                 interval: 2,
-                peers: PeersFormat::Compact(ByteBuf::from::<&[u8]>(&[
-                    192, 145, 21, 34, 0, 45, 54, 225, 23, 1, 17, 82,
-                ])),
+                peers: PeersFormat::Compact(Vec::from(
+                    &[192, 145, 21, 34, 0, 45, 54, 225, 23, 1, 17, 82][..],
+                )),
             }),
         };
 
@@ -462,10 +526,28 @@ mod tests {
                 failure: None,
                 success: Some(Success {
                     interval: 2,
-                    peers: PeersFormat::Compact(ByteBuf::from::<&[u8]>(&[192, 145, 21, 34, 0])),
+                    peers: PeersFormat::Compact(Vec::from(&[192, 145, 21, 34, 0][..])),
                 }),
             }),
             Err(RbitError::InvalidPeers("invalid peers compact format"))
         );
     }
+
+    // #[tokio::test]
+    // async fn check_peers_request() {
+    //     let url = Url::parse("http://bttracker.debian.org:6969/announce").unwrap();
+    //     let port = 6881;
+    //     let peer_id = crate::PeerId::build();
+    //     let timeout = Duration::from_millis(4000);
+    //     let sha1 = crate::InfoHash([
+    //         0x8F, 0xFE, 0xAE, 0x56, 0xC3, 0x2A, 0xB5, 0x4D, 0x99, 0x92, 0xE4, 0xCB, 0xB2, 0xE,
+    //         0xF0, 0x70, 0x63, 0x7A, 0x9C, 0x72,
+    //     ]);
+    //
+    //     let result = crate::TrackerClient::new(url, &sha1, &peer_id, timeout)
+    //         .fetch_peers(port, 0, 0, 658505728, super::Event::Started)
+    //         .await;
+    //
+    //     println!("{result:?}");
+    // }
 }
