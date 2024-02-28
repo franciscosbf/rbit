@@ -8,6 +8,8 @@ pub enum RbitError {
     InvalidFieldValue(&'static str),
     #[error("Error trying get peers: {0}")]
     TrackerFailed(#[from] reqwest::Error),
+    #[error("Invalid tracker response")]
+    InvalidTrackerResponse,
     #[error("Invalid peers data: {0}")]
     InvalidPeers(&'static str),
     #[error("Tracker returned an error: {0}")]
