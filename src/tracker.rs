@@ -66,19 +66,29 @@ struct Success {
     peers: PeersFormat,
 }
 
-impl FromBencode for Success {
+#[derive(Debug)]
+struct TrackerResponse {
+    failure: Option<String>,
+    success: Option<Success>,
+}
+
+impl FromBencode for TrackerResponse {
     const EXPECTED_RECURSION_DEPTH: usize = Peer::EXPECTED_RECURSION_DEPTH + 1;
 
     fn decode_bencode_object(object: Object) -> Result<Self, Error>
     where
         Self: Sized,
     {
+        let mut failure = None;
         let mut interval = None;
         let mut peers = None;
 
         let mut dict = object.try_into_dictionary()?;
         while let Some(pair) = dict.next_pair()? {
             match pair {
+                (b"failure reason", value) => {
+                    failure = String::decode_bencode_object(value).map(Some)?;
+                }
                 (b"interval", value) => {
                     let raw_interval = value.try_into_integer()?;
 
@@ -111,41 +121,10 @@ impl FromBencode for Success {
             }
         }
 
-        let interval = interval.ok_or_else(|| Error::missing_field("interval"))?;
-        let peers = peers.ok_or_else(|| Error::missing_field("peers"))?;
-
-        Ok(Success { interval, peers })
-    }
-}
-
-#[derive(Debug)]
-struct TrackerResponse {
-    failure: Option<String>,
-    success: Option<Success>,
-}
-
-impl FromBencode for TrackerResponse {
-    const EXPECTED_RECURSION_DEPTH: usize = Success::EXPECTED_RECURSION_DEPTH + 1;
-
-    fn decode_bencode_object(object: Object) -> Result<Self, Error>
-    where
-        Self: Sized,
-    {
-        let mut failure = None;
-        let mut success = None;
-
-        let mut dict = object.try_into_dictionary()?;
-        while let Some(pair) = dict.next_pair()? {
-            match pair {
-                (b"failure reason", value) => {
-                    failure = String::decode_bencode_object(value).map(Some)?;
-                }
-                (b"success", value) => {
-                    success = Success::decode_bencode_object(value).map(Some)?;
-                }
-                _ => (),
-            }
-        }
+        let success = match (interval, peers) {
+            (Some(interval), Some(peers)) => Some(Success { interval, peers }),
+            _ => return Err(Error::missing_field("interval and/or peers")),
+        };
 
         Ok(TrackerResponse { failure, success })
     }
@@ -281,7 +260,7 @@ impl TryFrom<TrackerResponse> for Peers {
 
                 Ok(Peers::new(interval, addresses))
             }
-            _ => Err(RbitError::InvalidPeers("unexpected format")),
+            _ => unreachable!(),
         }
     }
 }
@@ -535,7 +514,7 @@ mod tests {
 
     // #[tokio::test]
     // async fn check_peers_request() {
-    //     let url = Url::parse("http://bttracker.debian.org:6969/announce").unwrap();
+    //     let url = url::Url::parse("http://bttracker.debian.org:6969/announce").unwrap();
     //     let port = 6881;
     //     let peer_id = crate::PeerId::build();
     //     let timeout = Duration::from_millis(4000);
