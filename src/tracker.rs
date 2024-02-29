@@ -73,13 +73,12 @@ struct TrackerResponse {
 }
 
 impl FromBencode for TrackerResponse {
-    const EXPECTED_RECURSION_DEPTH: usize = Peer::EXPECTED_RECURSION_DEPTH + 1;
+    const EXPECTED_RECURSION_DEPTH: usize = Peer::EXPECTED_RECURSION_DEPTH + 2;
 
     fn decode_bencode_object(object: Object) -> Result<Self, Error>
     where
         Self: Sized,
     {
-        let mut failure = None;
         let mut interval = None;
         let mut peers = None;
 
@@ -87,7 +86,12 @@ impl FromBencode for TrackerResponse {
         while let Some(pair) = dict.next_pair()? {
             match pair {
                 (b"failure reason", value) => {
-                    failure = String::decode_bencode_object(value).map(Some)?;
+                    let failure = String::decode_bencode_object(value).map(Some)?;
+
+                    return Ok(TrackerResponse {
+                        failure,
+                        success: None,
+                    });
                 }
                 (b"interval", value) => {
                     let raw_interval = value.try_into_integer()?;
@@ -126,7 +130,10 @@ impl FromBencode for TrackerResponse {
             _ => return Err(Error::missing_field("interval and/or peers")),
         };
 
-        Ok(TrackerResponse { failure, success })
+        Ok(TrackerResponse {
+            failure: None,
+            success,
+        })
     }
 }
 
@@ -329,11 +336,60 @@ mod tests {
         time::Duration,
     };
 
-    use claims::{assert_matches, assert_ok};
+    use bendy::decoding::FromBencode;
+    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
 
     use crate::{error::RbitError, PeerAddr};
 
     use super::{Interval, Peer, Peers, PeersFormat, Success, TrackerResponse};
+
+    #[test]
+    fn parse_failure_response() {
+        let raw = b"d14:failure reason4:teste";
+
+        let response = assert_ok!(TrackerResponse::from_bencode(raw));
+        assert_some_eq!(response.failure, "test");
+        assert_none!(response.success);
+    }
+
+    #[test]
+    fn parse_success_response_with_peers_in_simple_format() {
+        let raw = b"d8:intervali6e5:peersld2:ip11:192.168.4.3\
+            4:porti123eed2:ip12:192.232.4.324:porti545eeee";
+
+        let response = assert_ok!(TrackerResponse::from_bencode(raw));
+        assert_none!(response.failure);
+        let success = assert_some!(response.success);
+        assert_eq!(success.interval, 6);
+        match success.peers {
+            PeersFormat::Simple(peers) => {
+                assert_eq!(peers.len(), 2);
+                let peer1 = &peers[0];
+                assert_eq!(peer1.ip, "192.168.4.3");
+                assert_eq!(peer1.port, 123);
+                let peer2 = &peers[1];
+                assert_eq!(peer2.ip, "192.232.4.32");
+                assert_eq!(peer2.port, 545);
+            }
+            _ => panic!("unexpecting peers compact format"),
+        }
+    }
+
+    #[test]
+    fn parse_success_response_with_peers_in_compact_format() {
+        let raw = b"d8:intervali16e5:peers12:\xC0\xA8\x04\x03\x00\x7B\xC0\xE8\x04\x20\x02\x21e";
+
+        let response = assert_ok!(TrackerResponse::from_bencode(raw));
+        assert_none!(response.failure);
+        let success = assert_some!(response.success);
+        assert_eq!(success.interval, 16);
+        match success.peers {
+            PeersFormat::Compact(peers) => {
+                assert_eq!(peers, b"\xC0\xA8\x04\x03\x00\x7B\xC0\xE8\x04\x20\x02\x21");
+            }
+            _ => panic!("unexpecting peers simple format"),
+        }
+    }
 
     #[test]
     fn parse_valid_interval() {
