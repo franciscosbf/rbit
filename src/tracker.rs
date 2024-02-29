@@ -267,7 +267,7 @@ impl TryFrom<TrackerResponse> for Peers {
 
                 Ok(Peers::new(interval, addresses))
             }
-            _ => unreachable!(),
+            _ => Err(RbitError::InvalidPeers("peers are missing")),
         }
     }
 }
@@ -550,7 +550,7 @@ mod tests {
                 failure: None,
                 success: None,
             }),
-            Err(RbitError::InvalidPeers("unexpected format"))
+            Err(RbitError::InvalidPeers("peers are missing"))
         );
     }
 
