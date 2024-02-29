@@ -274,19 +274,19 @@ impl TryFrom<TrackerResponse> for Peers {
 
 pub struct TrackerClient {
     http_client: reqwest::Client,
-    base_tracker_url: Url,
+    base_url: Url,
 }
 
 impl TrackerClient {
     pub fn new(
-        mut base_tracker_url: Url,
+        mut base_url: Url,
         info_hash: &InfoHash,
         peer_id: &PeerId,
         timeout: Duration,
     ) -> Self {
         let http_client = reqwest::Client::builder().timeout(timeout).build().unwrap();
 
-        base_tracker_url
+        base_url
             .query_pairs_mut()
             .append_pair("info_hash", bytes_to_str(&info_hash[..]))
             .append_pair("peer_id", bytes_to_str(peer_id))
@@ -294,7 +294,7 @@ impl TrackerClient {
 
         Self {
             http_client,
-            base_tracker_url,
+            base_url,
         }
     }
 
@@ -308,7 +308,7 @@ impl TrackerClient {
     ) -> Result<Peers, RbitError> {
         let body = self
             .http_client
-            .get(self.base_tracker_url.as_str())
+            .get(self.base_url.as_str())
             .query(&[("port", listening_port.to_string())])
             .query(&[("uploaded", uploaded)])
             .query(&[("downloaded", downloaded)])
@@ -338,8 +338,13 @@ mod tests {
 
     use bendy::decoding::FromBencode;
     use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
+    use url::Url;
+    use wiremock::{
+        matchers::{any, query_param, query_param_contains},
+        Mock, MockServer, ResponseTemplate,
+    };
 
-    use crate::{error::RbitError, PeerAddr};
+    use crate::{error::RbitError, InfoHash, PeerAddr, PeerId, TrackerClient};
 
     use super::{Interval, Peer, Peers, PeersFormat, Success, TrackerResponse};
 
@@ -568,21 +573,56 @@ mod tests {
         );
     }
 
-    // #[tokio::test]
-    // async fn check_peers_request() {
-    //     let url = url::Url::parse("http://bttracker.debian.org:6969/announce").unwrap();
-    //     let port = 6881;
-    //     let peer_id = crate::PeerId::build();
-    //     let timeout = Duration::from_millis(4000);
-    //     let sha1 = crate::InfoHash([
-    //         0x8F, 0xFE, 0xAE, 0x56, 0xC3, 0x2A, 0xB5, 0x4D, 0x99, 0x92, 0xE4, 0xCB, 0xB2, 0xE,
-    //         0xF0, 0x70, 0x63, 0x7A, 0x9C, 0x72,
-    //     ]);
-    //
-    //     let result = crate::TrackerClient::new(url, &sha1, &peer_id, timeout)
-    //         .fetch_peers(port, 0, 0, 658505728, super::Event::Started)
-    //         .await;
-    //
-    //     println!("{result:?}");
-    // }
+    #[tokio::test]
+    async fn check_peers_request() {
+        let mock_server = MockServer::start().await;
+
+        let base_url = Url::parse(mock_server.uri().as_str()).unwrap();
+        let peer_id = PeerId([
+            0x2D, 0x52, 0x42, 0x30, 0x31, 0x30, 0x30, 0x2D, 0x98, 0x9D, 0xB1, 0x22, 0x2C, 0xCA,
+            0x8C, 0xC5, 0x99, 0xC3, 0x42, 0xD4,
+        ]);
+        let timeout = Duration::from_millis(4000);
+        let info_hash = InfoHash([
+            0x8F, 0xFE, 0xAE, 0x56, 0xC3, 0x2A, 0xB5, 0x4D, 0x99, 0x92, 0xE4, 0xCB, 0xB2, 0xE,
+            0xF0, 0x70, 0x63, 0x7A, 0x9C, 0x72,
+        ]);
+
+        Mock::given(any())
+            .and(query_param_contains("info_hash", ""))
+            .and(query_param_contains("peer_id", "-RB0100-"))
+            .and(query_param("port", "6881"))
+            .and(query_param("uploaded", "0"))
+            .and(query_param("downloaded", "0"))
+            .and(query_param("left", "658505728"))
+            .and(query_param("compact", "1"))
+            .and(query_param("event", "started"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(
+                    b"d8:intervali16e5:peers12:\xC0\xA8\x04\x03\x00\x7B\xC0\xE8\x04\x20\x02\x21e"
+                        .as_slice(),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let result = TrackerClient::new(base_url, &info_hash, &peer_id, timeout)
+            .fetch_peers(6881, 0, 0, 658505728, super::Event::Started)
+            .await;
+
+        let response = assert_ok!(result);
+        assert_eq!(response.interval.0, Duration::from_secs(16));
+        assert_eq!(response.addresses.len(), 2);
+        let peer1 = &response.addresses[0];
+        assert_eq!(
+            peer1.0,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 3)), 123)
+        );
+        let peer2 = &response.addresses[1];
+        assert_eq!(
+            peer2.0,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 232, 4, 32)), 545)
+        );
+    }
 }
