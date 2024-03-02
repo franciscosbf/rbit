@@ -193,9 +193,9 @@ impl Message {
     }
 }
 
-pub struct RequestedPiece {
-    pub index: u64,
-    pub hash: HashPiece,
+struct RequestedPiece {
+    index: u64,
+    hash: HashPiece,
 }
 
 pub struct ReceivedPiece {
@@ -352,17 +352,25 @@ impl Deref for BasePeer {
     }
 }
 
-pub struct PeerClient(BasePeer);
+pub struct PeerClient {
+    base: BasePeer,
+    requested_pieces: mpsc::Sender<RequestedPiece>,
+}
 
 impl PeerClient {
     pub fn start(
         address: PeerAddr,
         num_pieces: u64,
-        requested_pieces: mpsc::Receiver<RequestedPiece>,
         received_pieces: mpsc::Sender<ReceivedPiece>,
         missing_pieces: mpsc::Sender<MissingPiece>,
     ) -> Result<Self, RbitError> {
         todo!()
+    }
+
+    pub async fn request_piece(&self, index: u64, hash: HashPiece) -> bool {
+        let request = RequestedPiece { index, hash };
+
+        self.requested_pieces.send(request).await.is_ok()
     }
 }
 
@@ -370,7 +378,7 @@ impl Deref for PeerClient {
     type Target = BasePeer;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.base
     }
 }
 
