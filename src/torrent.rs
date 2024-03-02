@@ -174,44 +174,50 @@ impl FromBencode for MetaInfo {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Piece<'a>(pub &'a [u8]);
+pub struct HashPiece(pub [u8; 20]);
 
-impl Deref for Piece<'_> {
+impl Deref for HashPiece {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.0
+        &self.0
+    }
+}
+
+impl From<&[u8]> for HashPiece {
+    fn from(value: &[u8]) -> Self {
+        HashPiece(value.try_into().unwrap())
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Pieces {
+pub struct HashPieces {
     buf: Vec<u8>,
 }
 
-impl Pieces {
+impl HashPieces {
     fn len(&self) -> usize {
         self.buf.len() / 20
     }
 
-    pub fn get_sha1(&self, index: usize) -> Option<Piece> {
-        let rindex = index * 20;
+    pub fn get(&self, index: u64) -> Option<HashPiece> {
+        let rindex = index as usize * 20;
 
         if (0..self.buf.len()).contains(&rindex) {
             let sha1 = &self.buf[rindex..(rindex + 20)];
-            Some(Piece(sha1))
+            Some(sha1.into())
         } else {
             None
         }
     }
 }
 
-impl TryFrom<Vec<u8>> for Pieces {
+impl TryFrom<Vec<u8>> for HashPieces {
     type Error = RbitError;
 
     fn try_from(pieces: Vec<u8>) -> Result<Self, Self::Error> {
         if !pieces.is_empty() && pieces.len() % 20 == 0 {
-            Ok(Pieces { buf: pieces })
+            Ok(HashPieces { buf: pieces })
         } else {
             Err(RbitError::InvalidFieldValue("info.pieces"))
         }
@@ -263,8 +269,8 @@ pub enum FileType {
 #[derive(Debug)]
 pub struct Torrent {
     pub tracker: Url,
-    pub piece: u64,
-    pub pieces: Pieces,
+    pub piece_size: u64,
+    pub hash_pieces: HashPieces,
     pub length: u64,
     pub file_type: FileType,
     pub info_hash: InfoHash,
@@ -274,15 +280,15 @@ impl Torrent {
     fn new(
         tracker: Url,
         piece: u64,
-        pieces: Pieces,
+        hash_pieces: HashPieces,
         length: u64,
         file_type: FileType,
         info_hash: InfoHash,
     ) -> Self {
         Self {
             tracker,
-            piece,
-            pieces,
+            piece_size: piece,
+            hash_pieces,
             length,
             file_type,
             info_hash,
@@ -317,7 +323,7 @@ impl TryFrom<MetaInfo> for Torrent {
             return Err(RbitError::InvalidFieldValue("info.piece"));
         };
 
-        let pieces = Pieces::try_from(info.pieces)?;
+        let hash_pieces = HashPieces::try_from(info.pieces)?;
 
         let (file_type, length) = match (info.length, info.files) {
             (Some(length), None) => {
@@ -353,7 +359,7 @@ impl TryFrom<MetaInfo> for Torrent {
                         let start = current;
                         let shift = start + (length + piece - 1) / piece;
                         let end = shift - 1;
-                        if shift as usize > pieces.len() {
+                        if shift as usize > hash_pieces.len() {
                             return Err(RbitError::InvalidFieldValue("info.pieces"));
                         }
                         current = shift;
@@ -377,7 +383,7 @@ impl TryFrom<MetaInfo> for Torrent {
 
         let info_hash = file.raw_info.as_slice().into();
 
-        let torrent = Torrent::new(tracker, piece, pieces, length, file_type, info_hash);
+        let torrent = Torrent::new(tracker, piece, hash_pieces, length, file_type, info_hash);
 
         Ok(torrent)
     }
@@ -396,32 +402,26 @@ mod tests {
     use claims::{assert_matches, assert_none, assert_ok, assert_some_eq};
     use url::Url;
 
-    use super::{parse, FileType, Piece, Pieces};
+    use super::{parse, FileType, HashPiece, HashPieces};
     use crate::error::RbitError;
 
     #[test]
     fn get_pieces_chunk_wih_valid_chunk() {
-        let pieces = Pieces {
+        let hash_pieces = HashPieces {
             buf: Vec::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
         };
 
-        assert_some_eq!(
-            pieces.get_sha1(0),
-            Piece(b"AAAAAAAAAAAAAAAAAAAA".as_slice())
-        );
-        assert_some_eq!(
-            pieces.get_sha1(1),
-            Piece(b"BBBBBBBBBBBBBBBBBBBB".as_slice())
-        );
+        assert_some_eq!(hash_pieces.get(0), HashPiece(*b"AAAAAAAAAAAAAAAAAAAA"));
+        assert_some_eq!(hash_pieces.get(1), HashPiece(*b"BBBBBBBBBBBBBBBBBBBB"));
     }
 
     #[test]
     fn get_pieces_chunk_wih_invalid_chunk() {
-        let pieces = Pieces {
+        let hash_pieces = HashPieces {
             buf: Vec::from(b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB".as_slice()),
         };
 
-        assert_none!(pieces.get_sha1(2));
+        assert_none!(hash_pieces.get(2));
     }
 
     #[test]
@@ -431,8 +431,8 @@ mod tests {
 
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
-        assert_eq!(torrent.piece, 1);
-        assert_eq!(torrent.pieces.buf, b"BBBBBBBBBBBBBBBBBBBB".as_slice());
+        assert_eq!(torrent.piece_size, 1);
+        assert_eq!(torrent.hash_pieces.buf, b"BBBBBBBBBBBBBBBBBBBB".as_slice());
         assert_eq!(torrent.length, 1);
         match torrent.file_type {
             FileType::Single { name } => {
@@ -452,11 +452,11 @@ mod tests {
 
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("http://test.com").unwrap());
-        assert_eq!(torrent.piece, 2);
-        assert_eq!(torrent.pieces.len(), 7);
+        assert_eq!(torrent.piece_size, 2);
+        assert_eq!(torrent.hash_pieces.len(), 7);
         assert_eq!(torrent.length, 13);
         assert_eq!(
-            torrent.pieces.buf,
+            torrent.hash_pieces.buf,
             b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
                 AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
                 AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA"
