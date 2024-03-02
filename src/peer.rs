@@ -358,7 +358,7 @@ impl PeerClient {
     pub fn start(
         address: PeerAddr,
         num_pieces: u64,
-        requested_pieces: Arc<mpsc::Receiver<RequestedPiece>>,
+        requested_pieces: mpsc::Receiver<RequestedPiece>,
         received_pieces: Arc<mpsc::Sender<ReceivedPiece>>,
         missing_pieces: Arc<mpsc::Sender<MissingPiece>>,
     ) -> Result<Self, RbitError> {
