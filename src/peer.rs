@@ -115,30 +115,31 @@ impl Message {
         }
     }
 
-    fn decode(content: &[u8]) -> Option<Self> {
-        if content.is_empty() {
+    fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.is_empty() {
             return Some(KeepAlive);
         }
 
-        let id = content[0];
-        let content = &content[1..];
+        let id = raw[0];
+        let len = raw.len();
+        let content = &raw[1..];
 
-        match id {
-            0 => Choke,
-            1 => Unchoke,
-            2 => Interested,
-            3 => NotIntersted,
-            4 => {
+        match (id, len) {
+            (0, 1) => Choke,
+            (1, 1) => Unchoke,
+            (2, 1) => Interested,
+            (3, 1) => NotIntersted,
+            (4, 5) => {
                 let piece = bytes_to_u32(content);
 
                 Have { piece }
             }
-            5 => {
-                let pieces = content[1..].into();
+            (5, len) if len > 1 => {
+                let pieces = content.into();
 
                 Bitfield { pieces }
             }
-            6 => {
+            (6, 13) => {
                 let index = bytes_to_u32(&content[0..4]);
                 let begin = bytes_to_u32(&content[4..8]);
                 let length = bytes_to_u32(&content[8..12]);
@@ -149,7 +150,7 @@ impl Message {
                     length,
                 }
             }
-            7 => {
+            (7, len) if len > 9 => {
                 let index = bytes_to_u32(&content[0..4]);
                 let begin = bytes_to_u32(&content[4..8]);
                 let block = content[8..].into();
@@ -160,7 +161,7 @@ impl Message {
                     block,
                 }
             }
-            8 => {
+            (8, 13) => {
                 let index = bytes_to_u32(&content[0..4]);
                 let begin = bytes_to_u32(&content[4..8]);
                 let length = bytes_to_u32(&content[8..12]);
