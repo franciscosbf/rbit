@@ -14,7 +14,7 @@ sha1 = "0.10.6"
 
 [dependencies.tokio]
 version = "1"
-features = ["macros", "rt", "rt-multi-thread", "net"]
+features = ["macros", "rt", "rt-multi-thread", "net", "sync"]
 
 [dependencies.rand]
 version = "0.8.5"
