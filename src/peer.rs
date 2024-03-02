@@ -359,8 +359,8 @@ impl PeerClient {
         address: PeerAddr,
         num_pieces: u64,
         requested_pieces: mpsc::Receiver<RequestedPiece>,
-        received_pieces: Arc<mpsc::Sender<ReceivedPiece>>,
-        missing_pieces: Arc<mpsc::Sender<MissingPiece>>,
+        received_pieces: mpsc::Sender<ReceivedPiece>,
+        missing_pieces: mpsc::Sender<MissingPiece>,
     ) -> Result<Self, RbitError> {
         todo!()
     }
@@ -380,7 +380,7 @@ impl PeerServer {
     pub fn start(
         stream: TcpListener,
         num_pieces: u64,
-        request_pieces: Arc<mpsc::Sender<PieceBlockRequest>>,
+        request_pieces: mpsc::Sender<PieceBlockRequest>,
     ) -> Result<Self, RbitError> {
         todo!()
     }
