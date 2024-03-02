@@ -11,11 +11,11 @@ use std::{
 };
 
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
 };
 
-use crate::{error::RbitError, file::FileBlock, HashPiece, PeerAddr};
+use crate::{error::RbitError, file::FileBlock, HashPiece};
 
 pub struct PeerId(pub [u8; 20]);
 
@@ -249,20 +249,23 @@ impl SwitchState {
 }
 
 struct PeerBitfield {
-    num_pieces: u64,
+    total_pieces: u64,
     pieces: RwLock<Vec<u8>>,
 }
 
 impl PeerBitfield {
-    fn new(num_pieces: u64) -> Self {
-        let bitfield_length = num_pieces + (8 - num_pieces % 8);
+    fn new(total_pieces: u64) -> Self {
+        let bitfield_length = total_pieces + (8 - total_pieces % 8);
         let pieces = RwLock::new(vec![0; bitfield_length as usize]);
 
-        Self { num_pieces, pieces }
+        Self {
+            total_pieces,
+            pieces,
+        }
     }
 
     fn has(&self, index: u64) -> Option<bool> {
-        if index >= self.num_pieces {
+        if index >= self.total_pieces {
             return None;
         }
 
@@ -275,7 +278,7 @@ impl PeerBitfield {
     }
 
     fn set(&self, index: u64) {
-        if index >= self.num_pieces {
+        if index >= self.total_pieces {
             return;
         }
 
@@ -292,11 +295,11 @@ pub struct PeerState {
 }
 
 impl PeerState {
-    fn new(num_pieces: u64) -> Self {
+    fn new(total_pieces: u64) -> Self {
         Self {
             choke: SwitchState::new(true),
             interest: SwitchState::new(false),
-            bitfield: PeerBitfield::new(num_pieces),
+            bitfield: PeerBitfield::new(total_pieces),
         }
     }
 
@@ -359,8 +362,8 @@ pub struct PeerClient {
 
 impl PeerClient {
     pub fn start(
-        address: PeerAddr,
-        num_pieces: u64,
+        stream: TcpStream,
+        total_pieces: u64,
         received_pieces: mpsc::Sender<ReceivedPiece>,
         missing_pieces: mpsc::Sender<MissingPiece>,
     ) -> Result<Self, RbitError> {
@@ -386,8 +389,8 @@ pub struct PeerServer(BasePeer);
 
 impl PeerServer {
     pub fn start(
-        stream: TcpListener,
-        num_pieces: u64,
+        listener: TcpListener,
+        total_pieces: u64,
         request_pieces: mpsc::Sender<PieceBlockRequest>,
     ) -> Result<Self, RbitError> {
         todo!()
