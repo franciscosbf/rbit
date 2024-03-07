@@ -227,9 +227,9 @@ impl TryFrom<Vec<u8>> for HashPieces {
 #[derive(Debug)]
 pub struct InfoHash(pub [u8; 20]);
 
-impl From<&[u8]> for InfoHash {
-    fn from(raw_info: &[u8]) -> Self {
-        InfoHash(Sha1::digest(raw_info).into())
+impl InfoHash {
+    fn hash(raw_info: &[u8]) -> Self {
+        Self(Sha1::digest(raw_info).into())
     }
 }
 
@@ -381,7 +381,7 @@ impl TryFrom<MetaInfo> for Torrent {
             _ => return Err(RbitError::InvalidFile),
         };
 
-        let info_hash = file.raw_info.as_slice().into();
+        let info_hash = InfoHash::hash(file.raw_info.as_slice());
 
         let torrent = Torrent::new(tracker, piece, hash_pieces, length, file_type, info_hash);
 
