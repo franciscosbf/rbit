@@ -15,8 +15,9 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use crate::{error::RbitError, file::FileBlock, HashPiece};
+use crate::{error::RbitError, file::FileBlock, HashPiece, InfoHash};
 
+#[derive(Debug)]
 pub struct PeerId(pub [u8; 20]);
 
 impl PeerId {
@@ -31,6 +32,12 @@ impl PeerId {
 
     pub fn id(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl From<&[u8]> for PeerId {
+    fn from(value: &[u8]) -> Self {
+        PeerId(value.try_into().unwrap())
     }
 }
 
@@ -50,6 +57,52 @@ fn u32_to_bytes(value: u32) -> [u8; 4] {
     value.to_be_bytes()
 }
 
+#[derive(Debug)]
+struct Handshake<'a> {
+    protocol: &'a str,
+    info_hash: InfoHash,
+    peer_id: PeerId,
+}
+
+impl<'a> Handshake<'a> {
+    fn decode(raw: &'a [u8]) -> Option<Self> {
+        if raw.is_empty() {
+            return None;
+        }
+
+        let pstrlen = raw[0] as usize;
+
+        if raw.len() != pstrlen + 49 {
+            return None;
+        }
+
+        let raw = &raw[1..];
+        let protocol = unsafe { std::str::from_utf8_unchecked(&raw[..pstrlen]) };
+
+        let raw = &raw[pstrlen + 8..];
+        let info_hash = InfoHash(raw[..20].try_into().unwrap());
+
+        let peer_id = (&raw[20..]).into();
+
+        let handshake = Self {
+            protocol,
+            info_hash,
+            peer_id,
+        };
+
+        Some(handshake)
+    }
+
+    fn encode(self, buff: &mut Vec<u8>) {
+        buff.push(self.protocol.len() as u8);
+        buff.extend_from_slice(self.protocol.as_bytes());
+        buff.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        buff.extend_from_slice(&self.info_hash[..]);
+        buff.extend_from_slice(&self.peer_id);
+    }
+}
+
+#[derive(Debug)]
 enum Message {
     KeepAlive,
     Choke,
@@ -407,4 +460,340 @@ impl Deref for PeerServer {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use claims::{assert_matches, assert_none, assert_ok, assert_some};
+    use tokio::{
+        io::AsyncReadExt,
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        time::sleep,
+    };
+    use tokio_stream::StreamExt;
+
+    use crate::InfoHash;
+
+    use super::{Handshake, Message, PeerClient, PeerId};
+
+    #[test]
+    fn encode_handshake() {
+        let handshake = Handshake {
+            protocol: "BitTorrent protocol",
+            info_hash: InfoHash(*b"AAAAAAAAAAAAAAAAAAAA"),
+            peer_id: PeerId(*b"-RB0100-TPhjEUZd5yX2"),
+        };
+
+        let mut buff = vec![];
+        handshake.encode(&mut buff);
+
+        assert_eq!(
+            buff,
+            b"\x13BitTorrent protocol\
+            \x00\x00\x00\x00\x00\x00\x00\x00\
+            AAAAAAAAAAAAAAAAAAAA\
+            -RB0100-TPhjEUZd5yX2"
+        );
+    }
+
+    #[test]
+    fn decode_valid_handshake() {
+        let raw = b"\x13BitTorrent protocol\
+            \x00\x00\x00\x00\x00\x00\x00\x00\
+            AAAAAAAAAAAAAAAAAAAA\
+            -RB0100-TPhjEUZd5yX2";
+
+        let handshake = assert_some!(Handshake::decode(raw));
+        assert_eq!(handshake.protocol, "BitTorrent protocol");
+        assert_eq!(&handshake.info_hash.0, b"AAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(&handshake.peer_id.0, b"-RB0100-TPhjEUZd5yX2");
+    }
+
+    #[test]
+    fn decode_empty_handshake() {
+        let raw = b"";
+
+        assert_none!(Handshake::decode(raw));
+    }
+
+    #[test]
+    fn decode_invalid_handshake_size() {
+        let raw = b"\x13BitTorrent protocol\
+            -RB0100-TPhjEUZd5yX2";
+
+        assert_none!(Handshake::decode(raw));
+    }
+
+    #[test]
+    fn encode_keep_alive_message() {
+        let mut buff = vec![];
+        Message::KeepAlive.encode(&mut buff);
+
+        assert_eq!(buff, *b"\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn decode_keep_alive_message() {
+        let msg = assert_some!(Message::decode(b""));
+        assert_matches!(msg, Message::KeepAlive);
+    }
+
+    #[test]
+    fn encode_choke_message() {
+        let mut buff = vec![];
+        Message::Choke.encode(&mut buff);
+
+        assert_eq!(buff, *b"\x00\x00\x00\x01\x00");
+    }
+
+    #[test]
+    fn decode_choke_message() {
+        let msg = assert_some!(Message::decode(b"\x00"));
+        assert_matches!(msg, Message::Choke);
+    }
+
+    #[test]
+    fn encode_unchoke_message() {
+        let mut buff = vec![];
+        Message::Unchoke.encode(&mut buff);
+
+        assert_eq!(buff, *b"\x00\x00\x00\x01\x01");
+    }
+
+    #[test]
+    fn decode_unchoke_message() {
+        let msg = assert_some!(Message::decode(b"\x01"));
+        assert_matches!(msg, Message::Unchoke);
+    }
+
+    #[test]
+    fn encode_interested_message() {
+        let mut buff = vec![];
+        Message::Interested.encode(&mut buff);
+
+        assert_eq!(buff, *b"\x00\x00\x00\x01\x02");
+    }
+
+    #[test]
+    fn decode_interested_message() {
+        let msg = assert_some!(Message::decode(b"\x02"));
+        assert_matches!(msg, Message::Interested);
+    }
+
+    #[test]
+    fn encode_not_interested_message() {
+        let mut buff = vec![];
+        Message::NotIntersted.encode(&mut buff);
+
+        assert_eq!(buff, *b"\x00\x00\x00\x01\x03");
+    }
+
+    #[test]
+    fn decode_not_interested_message() {
+        let msg = assert_some!(Message::decode(b"\x03"));
+        assert_matches!(msg, Message::NotIntersted);
+    }
+
+    #[test]
+    fn encode_have_message() {
+        let mut buff = vec![];
+        Message::Have { piece: 1254 }.encode(&mut buff);
+
+        assert_eq!(buff, *b"\x00\x00\x00\x05\x04\x00\x00\x04\xe6");
+    }
+
+    #[test]
+    fn decode_have_message() {
+        let msg = assert_some!(Message::decode(b"\x04\x00\x00\x04\xe6"));
+        assert_matches!(msg, Message::Have { piece: 1254 });
+    }
+
+    #[test]
+    fn encode_bitfield_message() {
+        let mut buff = vec![];
+        Message::Bitfield {
+            pieces: b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95".to_vec(),
+        }
+        .encode(&mut buff);
+
+        assert_eq!(
+            buff,
+            *b"\x00\x00\x00\x0b\x05\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95"
+        );
+    }
+
+    #[test]
+    fn decode_bitfield_message() {
+        let msg = assert_some!(Message::decode(
+            b"\x05\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95"
+        ));
+        let pieces = b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95".to_vec();
+        assert_matches!(msg, Message::Bitfield { pieces });
+    }
+
+    #[test]
+    fn encode_request_message() {
+        let mut buff = vec![];
+        Message::Request {
+            index: 43,
+            begin: 23,
+            length: 556,
+        }
+        .encode(&mut buff);
+
+        assert_eq!(
+            buff,
+            *b"\x00\x00\x00\x0d\x06\x00\x00\x00\x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
+        );
+    }
+
+    #[test]
+    fn decode_request_message() {
+        let msg = assert_some!(Message::decode(
+            b"\x06\x00\x00\x00\x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
+        ));
+        assert_matches!(
+            msg,
+            Message::Request {
+                index: 43,
+                begin: 23,
+                length: 556
+            }
+        );
+    }
+
+    #[test]
+    fn encode_piece_message() {
+        let mut buff = vec![];
+        Message::Piece {
+            index: 43,
+            begin: 23,
+            block: b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95".to_vec(),
+        }
+        .encode(&mut buff);
+
+        assert_eq!(
+            buff,
+            *b"\x00\x00\x00\x13\x07\x00\x00\x00\x2b\x00\x00\x00\x17\
+                \xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95"
+        );
+    }
+
+    #[test]
+    fn decode_piece_message() {
+        let msg = assert_some!(Message::decode(
+            b"\x07\x00\x00\x00\x2b\x00\x00\x00\x17\
+                \xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95"
+        ));
+        let block = b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95".to_vec();
+        assert_matches!(
+            msg,
+            Message::Piece {
+                index: 43,
+                begin: 23,
+                block,
+            }
+        );
+    }
+
+    #[test]
+    fn encode_cancel_message() {
+        let mut buff = vec![];
+        Message::Cancel {
+            index: 43,
+            begin: 23,
+            length: 556,
+        }
+        .encode(&mut buff);
+
+        assert_eq!(
+            buff,
+            *b"\x00\x00\x00\x0d\x08\x00\x00\x00\x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
+        );
+    }
+
+    #[test]
+    fn decode_cancel_message() {
+        let msg = assert_some!(Message::decode(
+            b"\x08\x00\x00\x00\x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
+        ));
+        assert_matches!(
+            msg,
+            Message::Cancel {
+                index: 43,
+                begin: 23,
+                length: 556
+            }
+        );
+    }
+
+    #[test]
+    fn decode_invalid_message() {
+        assert_none!(Message::decode(b"\x69\x69"));
+    }
+
+    // #[tokio::test]
+    // async fn request_piece_to_and_receive_it() {
+    //     let (send_pieces, mut receive_pieces) = mpsc::channel(1);
+    //     let (send_missing_pieces, mut receive_missing_pieces) = mpsc::channel(1);
+    //
+    //     let listener: TcpListener =
+    //         TcpListener::bind("localhost:0").expect("Failed to bind address");
+    //     let addr = listener
+    //         .local_addr()
+    //         .expect("Failed to retrieve server address");
+    //     let peer = tokio::spawn(async move {
+    //         match listener.accept().await {
+    //             Ok((stream, _)) => {
+    //                 // TODO: send back handshake.
+    //
+    //                 // TODO: verify received message.
+    //                 // let (reader, writer) = stream.into_split();
+    //                 // let msg_len = assert_ok!(stream.read_u32().await);
+    //                 // let mut raw_msg = [0_u8; msg_len];
+    //                 // assert_ok!(stream.read_buf(&mut raw_msg).await);
+    //                 // let msg = assert_some!(Message::decode(&raw_msg));
+    //                 // match msg {
+    //                 //     Message::Request { index, begin, length } => {
+    //                 //
+    //                 //     }
+    //                 // }
+    //             }
+    //             Err(e) => panic!("Failed to accept connection: {}", e),
+    //         }
+    //     });
+    //
+    //     let stream = TcpStream::connect(addr)
+    //         .await
+    //         .expect("Failed to connect to listener");
+    //     let client = assert_ok!(PeerClient::start(
+    //         stream,
+    //         1,
+    //         send_pieces,
+    //         send_missing_pieces
+    //     ));
+    //
+    //     tokio::select! {
+    //         _ = sleep(Duration::from_millis(1000)) => {
+    //             panic!("Didn't receive piece from client");
+    //         }
+    //         _ = receive_missing_pieces => {
+    //             panic!("Received from peer in missing pieces channel");
+    //         }
+    //         received = received_pieces => {
+    //             assert_eq!(received.index, 0);
+    //             assert_eq!(received.piece.0, b"\xA2\x23\x45".as_slice());
+    //         }
+    //     }
+    //
+    //     assert_ok!(peer.await);
+    // }
+
+    // #[tokio::test]
+    // async fn receive_piece_request_in_server_and_give_it() {
+    //     let (sender, receiver) = mpsc::channel(1);
+    // }
 }

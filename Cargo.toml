@@ -11,10 +11,11 @@ thiserror = "1.0"
 url = "2.5"
 reqwest = "0.11"
 sha1 = "0.10.6"
+tokio-stream = "0.1"
 
 [dependencies.tokio]
 version = "1"
-features = ["macros", "rt", "rt-multi-thread", "net", "sync"]
+features = ["macros", "rt", "rt-multi-thread", "net", "sync", "io-util"]
 
 [dependencies.rand]
 version = "0.8.5"
