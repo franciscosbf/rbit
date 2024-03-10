@@ -834,6 +834,7 @@ mod tests {
         let bitfield = assert_some!(PeerBitfield::from_bytes(16, raw));
 
         assert_none!(bitfield.has(16));
+        assert_none!(bitfield.has(69));
 
         [0, 3, 6, 8, 10, 13, 15].iter().for_each(|&index| {
             assert_some_eq!(
@@ -843,6 +844,34 @@ mod tests {
                 index
             );
         });
+    }
+
+    #[test]
+    fn mark_pieces_in_bitfield() {
+        let bitfield = PeerBitfield::new(24);
+
+        bitfield.set(24);
+        bitfield.set(65);
+
+        assert!(bitfield
+            .pieces
+            .read()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .all(|&chunk| chunk == 0));
+
+        [0, 3, 6, 8, 10, 13, 15, 16, 18, 23]
+            .iter()
+            .for_each(|&index| {
+                bitfield.set(index);
+
+                assert!(
+                    bitfield.has(index).unwrap(),
+                    "pice of index {} isn't set",
+                    index
+                );
+            });
     }
 
     // #[tokio::test]
