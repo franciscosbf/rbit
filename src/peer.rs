@@ -301,6 +301,39 @@ impl SwitchState {
     }
 }
 
+fn bitfield_chunks(total_pieces: u64) -> u64 {
+    (total_pieces as f64 / 8.).ceil() as u64
+}
+
+struct BitfieldIndex {
+    chunk_index: usize,
+    offset: u64,
+}
+
+impl BitfieldIndex {
+    fn new(index: u64) -> Self {
+        let chunk_index = index as usize / 8;
+        let offset = 7 - index % 8;
+
+        Self {
+            chunk_index,
+            offset,
+        }
+    }
+}
+
+fn valid_bitfield(total_pieces: u64, raw: &[u8]) -> bool {
+    bitfield_chunks(total_pieces) as usize == raw.len()
+        && (total_pieces % 8 == 0 || {
+            let last_piece_index = total_pieces - 1;
+            let bindex = BitfieldIndex::new(last_piece_index);
+            let last_chunk = raw[bindex.chunk_index];
+
+            (0..bindex.offset).all(|offset| (last_chunk >> offset) & 1 == 0)
+        })
+}
+
+#[derive(Debug)]
 struct PeerBitfield {
     total_pieces: u64,
     pieces: RwLock<Vec<u8>>,
@@ -308,8 +341,8 @@ struct PeerBitfield {
 
 impl PeerBitfield {
     fn new(total_pieces: u64) -> Self {
-        let bitfield_length = total_pieces + (8 - total_pieces % 8);
-        let pieces = RwLock::new(vec![0; bitfield_length as usize]);
+        let length = bitfield_chunks(total_pieces);
+        let pieces = RwLock::new(vec![0; length as usize]);
 
         Self {
             total_pieces,
@@ -317,15 +350,28 @@ impl PeerBitfield {
         }
     }
 
+    fn from_bytes(total_pieces: u64, raw: &[u8]) -> Option<Self> {
+        if !valid_bitfield(total_pieces, raw) {
+            return None;
+        }
+
+        let pieces = RwLock::new(raw.to_vec());
+        let bitfield = Self {
+            total_pieces,
+            pieces,
+        };
+
+        Some(bitfield)
+    }
+
     fn has(&self, index: u64) -> Option<bool> {
         if index >= self.total_pieces {
             return None;
         }
 
-        let chunk_index = index / 8;
-        let chunk = { self.pieces.read().unwrap()[chunk_index as usize] };
-        let offset = index % 8;
-        let piece = (chunk >> offset) & 1;
+        let bindex = BitfieldIndex::new(index);
+        let chunk = { self.pieces.read().unwrap()[bindex.chunk_index] };
+        let piece = (chunk >> bindex.offset) & 1;
 
         Some(piece == 1)
     }
@@ -335,9 +381,12 @@ impl PeerBitfield {
             return;
         }
 
-        let chunk_index = index / 8;
-        let offset = index % 8;
-        self.pieces.write().unwrap()[chunk_index as usize] |= 1 << offset;
+        let bindex = BitfieldIndex::new(index);
+        self.pieces.write().unwrap()[bindex.chunk_index] |= 1 << bindex.offset;
+    }
+
+    fn feed(&self, buff: &mut Vec<u8>) {
+        buff.extend_from_slice(self.pieces.read().unwrap().as_slice())
     }
 }
 
@@ -466,7 +515,7 @@ impl Deref for PeerServer {
 mod tests {
     use std::time::Duration;
 
-    use claims::{assert_matches, assert_none, assert_ok, assert_some};
+    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
         io::AsyncReadExt,
         net::{TcpListener, TcpStream},
@@ -477,7 +526,7 @@ mod tests {
 
     use crate::InfoHash;
 
-    use super::{Handshake, Message, PeerClient, PeerId};
+    use super::{Handshake, Message, PeerBitfield, PeerClient, PeerId};
 
     #[test]
     fn encode_handshake() {
@@ -733,6 +782,67 @@ mod tests {
     #[test]
     fn decode_invalid_message() {
         assert_none!(Message::decode(b"\x69\x69"));
+    }
+
+    #[test]
+    fn create_empty_peer_bitfield() {
+        let bitfield = PeerBitfield::new(42);
+
+        assert_eq!(bitfield.total_pieces, 42);
+        let pieces = bitfield.pieces.read().unwrap();
+        assert_eq!(pieces.len(), 6);
+        assert!(pieces.iter().all(|&chunk| chunk == 0));
+    }
+
+    #[test]
+    fn create_peer_bitfield_from_valid_raw_slice() {
+        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
+
+        let bitfield = assert_some!(PeerBitfield::from_bytes(30, raw));
+
+        assert_eq!(bitfield.total_pieces, 30);
+        let pieces = bitfield.pieces.read().unwrap();
+        assert_eq!(pieces.len(), 4);
+        assert_eq!(pieces.as_slice(), raw);
+    }
+
+    #[test]
+    fn create_peer_bitfield_from_valid_raw_slice_with_number_of_pieces_multiple_of_8() {
+        let raw = &[0b10110110, 0b10110111, 0b01010011];
+
+        assert_some!(PeerBitfield::from_bytes(24, raw));
+    }
+
+    #[test]
+    fn create_peer_bitfield_from_invalid_raw_slice() {
+        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
+
+        assert_none!(PeerBitfield::from_bytes(27, raw));
+    }
+
+    #[test]
+    fn create_peer_bitfield_from_invalid_pieces_length_with_raw_slice() {
+        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
+
+        assert_none!(PeerBitfield::from_bytes(16, raw));
+    }
+
+    #[test]
+    fn check_pieces_set_in_peer_bitfield() {
+        let raw = &[0b10010010, 0b10100101];
+
+        let bitfield = assert_some!(PeerBitfield::from_bytes(16, raw));
+
+        assert_none!(bitfield.has(16));
+
+        [0, 3, 6, 8, 10, 13, 15].iter().for_each(|&index| {
+            assert_some_eq!(
+                bitfield.has(index),
+                true,
+                "failed with pice of index {}",
+                index
+            );
+        });
     }
 
     // #[tokio::test]
