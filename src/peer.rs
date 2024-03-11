@@ -498,7 +498,7 @@ impl PeerServer {
         todo!()
     }
 
-    pub fn set_piece(&self, index: u64) {
+    pub fn mark_available_piece(&self, index: u64) {
         self.state.set_piece(index);
     }
 }
