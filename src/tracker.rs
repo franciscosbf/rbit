@@ -172,7 +172,7 @@ impl From<u64> for Interval {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PeerAddr(SocketAddr);
 
 impl From<SocketAddr> for PeerAddr {
