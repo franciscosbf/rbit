@@ -744,7 +744,7 @@ async fn accepted_handshake(
     Ok(match_handshake)
 }
 
-const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(2000);
+const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(1000);
 
 fn spawn_sender(
     mut writer: StreamWriter,
@@ -756,32 +756,29 @@ fn spawn_sender(
         let mut queue_check = interval(QUEUE_CHECK_TIMEOUT);
 
         loop {
-            let message = tokio::select! {
+            tokio::select! {
                 _ = checker.stopped_wait() => return,
                 maybe_message = messages.recv() => {
-                    match maybe_message {
+                    let message = match maybe_message {
                         Some(message) => message,
                         None => return,
-                    }
-                }
-                _ = queue_check.tick() => {
-                    let flushed_buff = match writer.send_buffered().await {
-                        Ok(flushed_buff) => flushed_buff,
-                        Err(_) => return,
                     };
 
-                    if !flushed_buff {
-                        writer.fill_buffer(Message::KeepAlive);
-                        if writer.send_buffered().await.is_err() {
-                            return;
+                    writer.fill_buffer(message);
+                }
+                _ = queue_check.tick() => {
+                    match writer.send_buffered().await {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            writer.fill_buffer(Message::KeepAlive);
+                            if writer.send_buffered().await.is_err() {
+                                return;
+                            }
                         }
+                        Err(_) => return,
                     }
-
-                    continue;
                 }
             };
-
-            writer.fill_buffer(message);
         }
     });
 }
