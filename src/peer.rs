@@ -578,15 +578,65 @@ impl PeerState {
     }
 }
 
-pub struct ClientSenders {
-    pub received_piece_blocks: mpsc::Sender<ClientReceivedPiece>,
+#[derive(Clone)]
+pub struct BaseSenders {
     pub request_pieces: mpsc::Sender<PieceBlockRequest>,
     pub canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
 }
 
-pub struct ServerSenders {
-    pub request_pieces: mpsc::Sender<PieceBlockRequest>,
-    pub canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
+#[derive(Clone)]
+pub struct ClientSenders {
+    base: BaseSenders,
+    pub received_piece_blocks: mpsc::Sender<ClientReceivedPiece>,
+}
+
+impl ClientSenders {
+    pub fn new(
+        request_pieces: mpsc::Sender<PieceBlockRequest>,
+        canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
+        received_piece_blocks: mpsc::Sender<ClientReceivedPiece>,
+    ) -> Self {
+        let base = BaseSenders {
+            request_pieces,
+            canceled_pieces,
+        };
+
+        Self {
+            base,
+            received_piece_blocks,
+        }
+    }
+}
+
+impl Deref for ClientSenders {
+    type Target = BaseSenders;
+
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+#[derive(Clone)]
+pub struct ServerSenders(BaseSenders);
+
+impl ServerSenders {
+    pub fn new(
+        request_pieces: mpsc::Sender<PieceBlockRequest>,
+        canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
+    ) -> Self {
+        Self(BaseSenders {
+            request_pieces,
+            canceled_pieces,
+        })
+    }
+}
+
+impl Deref for ServerSenders {
+    type Target = BaseSenders;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 enum StreamRead {
