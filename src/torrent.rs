@@ -294,6 +294,10 @@ impl Torrent {
             info_hash,
         }
     }
+
+    pub fn num_pieces(&self) -> usize {
+        self.hash_pieces.len()
+    }
 }
 
 impl TryFrom<MetaInfo> for Torrent {
@@ -432,8 +436,9 @@ mod tests {
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
         assert_eq!(torrent.piece_size, 1);
-        assert_eq!(torrent.hash_pieces.buf, b"BBBBBBBBBBBBBBBBBBBB".as_slice());
+        assert_eq!(torrent.num_pieces(), 1);
         assert_eq!(torrent.length, 1);
+        assert_eq!(torrent.hash_pieces.buf, b"BBBBBBBBBBBBBBBBBBBB".as_slice());
         match torrent.file_type {
             FileType::Single { name } => {
                 assert_eq!(name, "test");
@@ -453,7 +458,7 @@ mod tests {
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("http://test.com").unwrap());
         assert_eq!(torrent.piece_size, 2);
-        assert_eq!(torrent.hash_pieces.len(), 7);
+        assert_eq!(torrent.num_pieces(), 7);
         assert_eq!(torrent.length, 13);
         assert_eq!(
             torrent.hash_pieces.buf,
