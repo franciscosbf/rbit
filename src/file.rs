@@ -10,8 +10,8 @@ impl Deref for FileBlock {
     }
 }
 
-impl From<&[u8]> for FileBlock {
-    fn from(value: &[u8]) -> Self {
-        FileBlock(value.into())
+impl From<Vec<u8>> for FileBlock {
+    fn from(value: Vec<u8>) -> Self {
+        FileBlock(value)
     }
 }

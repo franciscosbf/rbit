@@ -3,8 +3,7 @@
 #![allow(unused_variables)]
 
 use std::{
-    net::SocketAddr,
-    ops::Deref,
+    ops::{Deref, RangeInclusive},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
@@ -12,12 +11,13 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{tcp, TcpListener, TcpStream},
+    sync::{mpsc, watch},
+    time::{interval, Interval},
 };
 
-use crate::{file::FileBlock, HashPiece, InfoHash, PeerAddr};
+use crate::{file::FileBlock, InfoHash, PeerAddr, Torrent};
 
 #[derive(Debug, Clone, Copy)]
 pub struct PeerId(pub [u8; 20]);
@@ -132,8 +132,132 @@ impl Handshake {
     }
 }
 
+fn bitfield_chunks(total_pieces: u32) -> u32 {
+    (total_pieces as f64 / 8.).ceil() as u32
+}
+
+struct BitfieldIndex {
+    chunk_index: usize,
+    offset: u32,
+}
+
+impl BitfieldIndex {
+    fn new(index: u32) -> Self {
+        let chunk_index = index as usize / 8;
+        let offset = 7 - index % 8;
+
+        Self {
+            chunk_index,
+            offset,
+        }
+    }
+}
+
+fn valid_bitfield(total_pieces: u32, raw: &[u8]) -> bool {
+    bitfield_chunks(total_pieces) as usize == raw.len()
+        && (total_pieces % 8 == 0 || {
+            let last_piece_index = total_pieces - 1;
+            let bindex = BitfieldIndex::new(last_piece_index);
+            let last_chunk = raw[bindex.chunk_index];
+
+            (0..bindex.offset).all(|offset| (last_chunk >> offset) & 1 == 0)
+        })
+}
+
 #[derive(Debug)]
-enum Message {
+pub struct PeerBitfieldInner {
+    total_pieces: u32,
+    pieces: RwLock<Vec<u8>>,
+}
+
+impl PeerBitfieldInner {
+    fn append_overwrite(&self, raw: &[u8]) -> bool {
+        if !valid_bitfield(self.total_pieces, raw) {
+            return false;
+        }
+
+        self.pieces
+            .write()
+            .unwrap()
+            .iter_mut()
+            .zip(raw)
+            .for_each(|(current_chunk, new_chunk)| {
+                *current_chunk |= new_chunk;
+            });
+
+        true
+    }
+
+    pub fn has(&self, index: u32) -> Option<bool> {
+        if index >= self.total_pieces {
+            return None;
+        }
+
+        let bindex = BitfieldIndex::new(index);
+        let chunk = { self.pieces.read().unwrap()[bindex.chunk_index] };
+        let piece = (chunk >> bindex.offset) & 1;
+
+        Some(piece == 1)
+    }
+
+    pub fn set(&self, index: u32) {
+        if index >= self.total_pieces {
+            return;
+        }
+
+        let bindex = BitfieldIndex::new(index);
+        self.pieces.write().unwrap()[bindex.chunk_index] |= 1 << bindex.offset;
+    }
+
+    pub fn raw(&self) -> Vec<u8> {
+        self.pieces.read().unwrap().clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerBitfield {
+    inner: Arc<PeerBitfieldInner>,
+}
+
+impl PeerBitfield {
+    pub fn new(total_pieces: u32) -> Self {
+        let length = bitfield_chunks(total_pieces);
+        let pieces = RwLock::new(vec![0; length as usize]);
+
+        let inner = Arc::new(PeerBitfieldInner {
+            total_pieces,
+            pieces,
+        });
+
+        Self { inner }
+    }
+
+    pub fn from_bytes(total_pieces: u32, raw: &[u8]) -> Option<Self> {
+        if !valid_bitfield(total_pieces, raw) {
+            return None;
+        }
+
+        let pieces = RwLock::new(raw.to_vec());
+        let inner = Arc::new(PeerBitfieldInner {
+            total_pieces,
+            pieces,
+        });
+        let bitfield = PeerBitfield { inner };
+
+        Some(bitfield)
+    }
+}
+
+impl Deref for PeerBitfield {
+    type Target = PeerBitfieldInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[derive(Debug)]
+pub enum Message {
     KeepAlive,
     Choke,
     Unchoke,
@@ -177,7 +301,7 @@ impl Message {
             Message::Bitfield { pieces } => {
                 buff.extend_from_slice(&u32_to_bytes(1 + pieces.len() as u32));
                 buff.push(5);
-                buff.extend_from_slice(&pieces);
+                buff.extend_from_slice(pieces.as_slice());
             }
             Message::Request {
                 index,
@@ -276,42 +400,61 @@ impl Message {
     }
 }
 
-struct RequestedPiece {
-    index: u32,
-    hash: HashPiece,
+pub enum PieceBlockSender {
+    Client,
+    Server,
 }
 
-pub struct ReceivedPiece {
+pub struct ClientReceivedPiece {
     pub index: u32,
     pub begin: u32,
     pub piece: FileBlock,
     pub peer_addr: PeerAddr,
 }
 
-pub struct PieceBlockRequest {
+pub struct PieceBlock {
     pub index: u32,
     pub begin: u32,
     pub length: u32,
     pub peer_addr: PeerAddr,
-    available_blocks: mpsc::Sender<FileBlock>,
+    pub sender: PieceBlockSender,
 }
 
-pub struct CanceledPieceBlock {
-    pub index: u32,
-    pub begin: u32,
-    pub length: u32,
-    pub peer_addr: PeerAddr,
-}
+pub struct PieceBlockRequest(PieceBlock);
 
-impl PieceBlockRequest {
-    pub async fn give(self, block: FileBlock) {
-        let _ = self.available_blocks.send(block).await;
+impl Deref for PieceBlockRequest {
+    type Target = PieceBlock;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-struct SwitchState(AtomicBool);
+impl From<PieceBlock> for PieceBlockRequest {
+    fn from(value: PieceBlock) -> Self {
+        PieceBlockRequest(value)
+    }
+}
 
-impl SwitchState {
+pub struct CanceledPieceBlock(PieceBlock);
+
+impl Deref for CanceledPieceBlock {
+    type Target = PieceBlock;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<PieceBlock> for CanceledPieceBlock {
+    fn from(value: PieceBlock) -> Self {
+        CanceledPieceBlock(value)
+    }
+}
+
+struct Switch(AtomicBool);
+
+impl Switch {
     fn new(initial_state: bool) -> Self {
         Self(AtomicBool::new(initial_state))
     }
@@ -329,164 +472,224 @@ impl SwitchState {
     }
 }
 
-fn bitfield_chunks(total_pieces: u32) -> u32 {
-    (total_pieces as f64 / 8.).ceil() as u32
-}
+struct StopperActor(watch::Sender<bool>);
 
-struct BitfieldIndex {
-    chunk_index: usize,
-    offset: u32,
-}
-
-impl BitfieldIndex {
-    fn new(index: u32) -> Self {
-        let chunk_index = index as usize / 8;
-        let offset = 7 - index % 8;
-
-        Self {
-            chunk_index,
-            offset,
-        }
+impl StopperActor {
+    fn stop(&self) {
+        let _ = self.0.send(true);
     }
 }
 
-fn valid_bitfield(total_pieces: u32, raw: &[u8]) -> bool {
-    bitfield_chunks(total_pieces) as usize == raw.len()
-        && (total_pieces % 8 == 0 || {
-            let last_piece_index = total_pieces - 1;
-            let bindex = BitfieldIndex::new(last_piece_index);
-            let last_chunk = raw[bindex.chunk_index];
+#[derive(Clone)]
+struct StopperCheck(watch::Receiver<bool>);
 
-            (0..bindex.offset).all(|offset| (last_chunk >> offset) & 1 == 0)
-        })
+impl StopperCheck {
+    async fn stopped_wait(&mut self) -> bool {
+        self.0.changed().await.map(|_| true).unwrap_or(true)
+    }
+
+    fn stopped(&mut self) -> bool {
+        self.0.has_changed().unwrap_or(true)
+    }
 }
 
-#[derive(Debug)]
-struct PeerBitfield {
-    total_pieces: u32,
-    pieces: RwLock<Vec<u8>>,
-}
+fn stopper() -> (StopperActor, StopperCheck) {
+    let (sender, receiver) = watch::channel(false);
 
-impl PeerBitfield {
-    fn new(total_pieces: u32) -> Self {
-        let length = bitfield_chunks(total_pieces);
-        let pieces = RwLock::new(vec![0; length as usize]);
+    let actor = StopperActor(sender);
+    let check = StopperCheck(receiver);
 
-        Self {
-            total_pieces,
-            pieces,
-        }
-    }
-
-    fn from_bytes(total_pieces: u32, raw: &[u8]) -> Option<Self> {
-        if !valid_bitfield(total_pieces, raw) {
-            return None;
-        }
-
-        let pieces = RwLock::new(raw.to_vec());
-        let bitfield = Self {
-            total_pieces,
-            pieces,
-        };
-
-        Some(bitfield)
-    }
-
-    fn overwrite(&self, raw: &[u8]) -> bool {
-        if !valid_bitfield(self.total_pieces, raw) {
-            return false;
-        }
-
-        self.pieces.write().unwrap().copy_from_slice(raw);
-
-        true
-    }
-
-    fn has(&self, index: u32) -> Option<bool> {
-        if index >= self.total_pieces {
-            return None;
-        }
-
-        let bindex = BitfieldIndex::new(index);
-        let chunk = { self.pieces.read().unwrap()[bindex.chunk_index] };
-        let piece = (chunk >> bindex.offset) & 1;
-
-        Some(piece == 1)
-    }
-
-    fn set(&self, index: u32) {
-        if index >= self.total_pieces {
-            return;
-        }
-
-        let bindex = BitfieldIndex::new(index);
-        self.pieces.write().unwrap()[bindex.chunk_index] |= 1 << bindex.offset;
-    }
-
-    fn feed(&self, buff: &mut Vec<u8>) {
-        buff.extend_from_slice(self.pieces.read().unwrap().as_slice())
-    }
+    (actor, check)
 }
 
 pub struct PeerState {
-    choke: SwitchState,
-    interest: SwitchState,
-    closed: SwitchState,
-    bitfield: PeerBitfield,
+    am_choking: Switch,
+    peer_choking: Switch,
+    am_interested: Switch,
+    peer_interested: Switch,
+    closed: Switch,
+    actor: StopperActor,
 }
 
 impl PeerState {
-    fn new(total_pieces: u32) -> Self {
+    fn new(actor: StopperActor) -> Self {
         Self {
-            choke: SwitchState::new(true),
-            interest: SwitchState::new(false),
-            closed: SwitchState::new(false),
-            bitfield: PeerBitfield::new(total_pieces),
+            am_choking: Switch::new(true),
+            peer_choking: Switch::new(true),
+            am_interested: Switch::new(false),
+            peer_interested: Switch::new(false),
+            closed: Switch::new(false),
+            actor,
         }
     }
 
-    fn choke(&self) {
-        self.choke.set();
+    fn am_choking(&self) {
+        self.am_choking.set();
     }
 
-    fn unchoke(&self) {
-        self.choke.unset();
+    fn am_unchoking(&self) {
+        self.am_choking.unset();
     }
 
-    fn interest(&self) {
-        self.interest.set();
+    fn peer_choking(&self) {
+        self.peer_choking.set();
     }
 
-    fn uninsterest(&self) {
-        self.interest.unset();
+    fn peer_unchoking(&self) {
+        self.peer_choking.unset();
     }
 
-    fn set_piece(&self, index: u32) {
-        self.bitfield.set(index);
+    fn am_interest(&self) {
+        self.am_interested.set();
     }
 
-    fn set_pieces(&self, raw: &[u8]) -> bool {
-        self.bitfield.overwrite(raw)
+    fn am_uninsterest(&self) {
+        self.am_interested.unset();
     }
 
-    fn set_closed(&self) {
+    fn peer_interest(&self) {
+        self.peer_interested.set();
+    }
+
+    fn peer_uninsterest(&self) {
+        self.peer_interested.unset();
+    }
+
+    fn close(&self) {
+        if self.closed() {
+            return;
+        }
+
         self.closed.set();
+
+        self.actor.stop();
     }
 
-    pub fn choked(&self) -> bool {
-        self.choke.current()
+    pub fn peer_choking_us(&self) -> bool {
+        self.peer_choking.current()
     }
 
-    pub fn interested(&self) -> bool {
-        self.interest.current()
+    pub fn am_interested_in_peer(&self) -> bool {
+        self.am_interested.current()
     }
 
     pub fn closed(&self) -> bool {
         self.closed.current()
     }
+}
 
-    pub fn has_piece(&self, index: u32) -> Option<bool> {
-        self.bitfield.has(index)
+pub struct ClientSenders {
+    pub received_piece_blocks: mpsc::Sender<ClientReceivedPiece>,
+    pub request_pieces: mpsc::Sender<PieceBlockRequest>,
+    pub canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
+}
+
+pub struct ServerSenders {
+    pub request_pieces: mpsc::Sender<PieceBlockRequest>,
+    pub canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
+}
+
+enum StreamRead {
+    Received(Message),
+    Invalid,
+    TimedOut,
+    Error,
+}
+
+struct StreamReader {
+    reader: tcp::OwnedReadHalf,
+    heartbeat: Interval,
+}
+
+impl StreamReader {
+    const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(2000);
+
+    fn new(reader: tcp::OwnedReadHalf) -> Self {
+        let heartbeat = interval(Self::HEARTBEAT_TIMEOUT);
+
+        Self { reader, heartbeat }
+    }
+
+    async fn next_message(&mut self) -> StreamRead {
+        let msg_len = tokio::select! {
+            _ = self.heartbeat.tick() => return StreamRead::TimedOut,
+            result = self.reader.read_u32() => {
+                match result {
+                    Ok(msg_len) => msg_len,
+                    Err(_) => return StreamRead::Error,
+                }
+            }
+        };
+
+        let mut raw = vec![0; msg_len as usize];
+
+        tokio::select! {
+            _ = self.heartbeat.tick() => return StreamRead::TimedOut,
+            result = self.reader.read_exact(&mut raw) => {
+                if result.is_err() {
+                    return StreamRead::Error;
+                }
+            }
+        }
+
+        Message::decode(&raw)
+            .map(StreamRead::Received)
+            .unwrap_or(StreamRead::Invalid)
+    }
+}
+
+struct StreamWriter {
+    writer: tcp::OwnedWriteHalf,
+    buffer: Vec<u8>,
+}
+
+impl StreamWriter {
+    fn new(writer: tcp::OwnedWriteHalf) -> Self {
+        let buffer = vec![];
+
+        Self { writer, buffer }
+    }
+
+    fn fill_buffer(&mut self, msg: Message) {
+        msg.encode(&mut self.buffer);
+    }
+
+    async fn send_buffered(&mut self) -> Result<(), tokio::io::Error> {
+        if !self.buffer.is_empty() {
+            self.writer.write_all(&self.buffer).await?;
+            self.writer.flush().await?;
+
+            self.buffer.clear();
+        }
+
+        Ok(())
+    }
+}
+
+fn split_stream(stream: TcpStream) -> (StreamReader, StreamWriter) {
+    let (reader, writer) = stream.into_split();
+
+    let stream_reader = StreamReader::new(reader);
+    let stream_writer = StreamWriter::new(writer);
+
+    (stream_reader, stream_writer)
+}
+
+struct RwTrials {
+    trials: RangeInclusive<u64>,
+}
+
+impl RwTrials {
+    const MAX: u64 = 3;
+
+    fn new() -> Self {
+        Self {
+            trials: (1..=Self::MAX),
+        }
+    }
+
+    fn exceeded(&mut self) -> bool {
+        self.trials.next().is_none()
     }
 }
 
@@ -507,88 +710,84 @@ async fn accepted_handshake(
     Ok(match_handshake)
 }
 
-pub struct ChannelSenders {
-    pub received_pieces: mpsc::Sender<ReceivedPiece>,
-    pub request_pieces: mpsc::Sender<PieceBlockRequest>,
-    pub canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
-}
-
-async fn spawn_client_msgs_sender(
-    peer_addr: PeerAddr,
-    is_client: bool,
-    mut sender: WriteHalf<TcpStream>,
+fn spawn_sender(
+    mut writer: StreamWriter,
     state: Arc<PeerState>,
-    requested_pieces: mpsc::Sender<RequestedPiece>,
-    available_blocks: mpsc::Sender<FileBlock>,
-) {
-    todo!();
-}
-
-async fn spawn_server_msgs_sender(
-    peer_addr: PeerAddr,
-    is_client: bool,
-    mut sender: WriteHalf<TcpStream>,
-    state: Arc<PeerState>,
-    available_blocks: mpsc::Sender<FileBlock>,
-) {
-    todo!();
-}
-
-async fn spawn_msgs_receiver(
-    peer_addr: PeerAddr,
-    is_client: bool,
-    mut receiver: ReadHalf<TcpStream>,
-    state: Arc<PeerState>,
-    channel_senders: ChannelSenders,
-    sender_available_blocks: mpsc::Sender<FileBlock>,
+    mut checker: StopperCheck,
+    mut messages: mpsc::Receiver<Message>,
+    send_queue_timeout: Duration,
 ) {
     tokio::spawn(async move {
-        let timeout = tokio::time::sleep(Duration::from_millis(1000));
-        tokio::pin!(timeout);
+        let mut trials = RwTrials::new();
+        let mut send_queue_alert = interval(send_queue_timeout);
 
         loop {
-            let msg_len = tokio::select! {
-                _ = &mut timeout => {
-                    if state.closed() {
+            let message = tokio::select! {
+                _ = checker.stopped_wait() => return,
+                maybe_message = messages.recv() => {
+                    match maybe_message {
+                        Some(message) => message,
+                        None => return,
+                    }
+                }
+                _ = send_queue_alert.tick() => {
+                    if writer.send_buffered().await.is_err() && trials.exceeded() {
+                        state.close();
                         return;
                     }
 
                     continue;
-                },
-                result = receiver.read_u32() => {
-                    match result {
-                        Ok(msg_len) => msg_len,
-                        Err(_) => break,
-                    }
                 }
             };
 
-            let msg_len = match receiver.read_u32().await {
-                Ok(msg_len) => msg_len,
-                Err(_) => break,
+            writer.fill_buffer(message);
+        }
+    });
+}
+
+fn spawn_client_receiver(
+    peer_addr: PeerAddr,
+    mut reader: StreamReader,
+    state: Arc<PeerState>,
+    bitfield: Arc<PeerBitfield>,
+    mut checker: StopperCheck,
+    senders: ClientSenders,
+) {
+    tokio::spawn(async move {
+        let mut trials = RwTrials::new();
+
+        loop {
+            let message = match reader.next_message().await {
+                StreamRead::Received(message) => message,
+                StreamRead::Invalid => continue,
+                StreamRead::TimedOut => {
+                    if checker.stopped() {
+                        return;
+                    }
+
+                    continue;
+                }
+                StreamRead::Error => {
+                    if trials.exceeded() {
+                        state.close();
+                        return;
+                    }
+
+                    continue;
+                }
             };
 
-            let mut raw = vec![0_u8; msg_len as usize];
-
-            if receiver.read_exact(&mut raw).await.is_err() {
-                break;
-            }
-
-            let msg = match Message::decode(&raw) {
-                Some(msg) => msg,
-                None => continue,
-            };
-
-            match msg {
-                Message::KeepAlive => (),
-                Message::Choke => state.choke(),
-                Message::Unchoke => state.unchoke(),
-                Message::Interested => state.interest(),
-                Message::NotIntersted => state.uninsterest(),
-                Message::Have { piece } if is_client => state.set_piece(piece),
-                Message::Bitfield { pieces } if !is_client => {
-                    if !state.set_pieces(&pieces) {
-                        break;
+            match message {
+                Message::KeepAlive => continue,
+                Message::Choke => state.am_choking(),
+                Message::Unchoke => state.am_unchoking(),
+                Message::Interested => state.peer_interest(),
+                Message::NotIntersted => state.peer_uninsterest(),
+                Message::Have { piece } => bitfield.set(piece),
+                Message::Bitfield { pieces } => {
+                    if bitfield.append_overwrite(&pieces) {
+                        state.close();
+                        return;
                     }
                 }
                 Message::Request {
@@ -596,144 +795,149 @@ async fn spawn_msgs_receiver(
                     begin,
                     length,
                 } => {
-                    let available_blocks = sender_available_blocks.clone();
-
-                    let request = PieceBlockRequest {
+                    let request = PieceBlock {
                         index,
                         begin,
                         length,
                         peer_addr,
-                        available_blocks,
-                    };
+                        sender: PieceBlockSender::Client,
+                    }
+                    .into();
+
+                    let _ = senders.request_pieces.send(request).await;
                 }
                 Message::Piece {
                     index,
                     begin,
                     block,
                 } => {
-                    let piece = block.as_slice().into();
+                    let piece = block.into();
 
-                    let received = ReceivedPiece {
+                    let piece_block = ClientReceivedPiece {
                         index,
                         begin,
                         piece,
                         peer_addr,
                     };
 
-                    if channel_senders
-                        .received_pieces
-                        .send(received)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                    let _ = senders.received_piece_blocks.send(piece_block).await;
                 }
                 Message::Cancel {
                     index,
                     begin,
                     length,
                 } => {
-                    let canceled = CanceledPieceBlock {
+                    let cancel = PieceBlock {
                         index,
                         begin,
                         length,
                         peer_addr,
-                    };
-
-                    if channel_senders
-                        .canceled_pieces
-                        .send(canceled)
-                        .await
-                        .is_err()
-                    {
-                        break;
+                        sender: PieceBlockSender::Client,
                     }
+                    .into();
+
+                    let _ = senders.canceled_pieces.send(cancel).await;
                 }
-                _ => (),
             }
         }
-
-        state.set_closed();
     });
 }
 
-pub struct BasePeer {
+pub struct PeerClient {
     state: Arc<PeerState>,
-    stop: oneshot::Sender<()>,
+    bitfield: Arc<PeerBitfield>,
+    messages_sender: mpsc::Sender<Message>,
 }
 
-impl BasePeer {
-    pub fn stop(self) {
-        let _ = self.stop.send(());
+impl PeerClient {
+    const BUFFERED_MESSAGES: usize = 20;
+    const SEND_QUEUE_TIMEOUT: Duration = Duration::from_millis(2000);
+
+    pub async fn start(
+        handshake: Arc<Handshake>,
+        mut stream: TcpStream,
+        torrent: Arc<Torrent>,
+        senders: ClientSenders,
+    ) -> Result<Option<Self>, std::io::Error> {
+        if !accepted_handshake(handshake, &mut stream).await? {
+            return Ok(None);
+        }
+
+        let peer_addr = stream.peer_addr().unwrap().into();
+
+        let (actor, checker) = stopper();
+        let (reader, writer) = split_stream(stream);
+        let (messages_sender, messages_receiver) = mpsc::channel(Self::BUFFERED_MESSAGES);
+
+        let state = Arc::new(PeerState::new(actor));
+        let bitfield = Arc::new(PeerBitfield::new(torrent.num_pieces() as u32));
+
+        spawn_sender(
+            writer,
+            state.clone(),
+            checker.clone(),
+            messages_receiver,
+            Self::SEND_QUEUE_TIMEOUT,
+        );
+
+        spawn_client_receiver(
+            peer_addr,
+            reader,
+            state.clone(),
+            bitfield.clone(),
+            checker,
+            senders,
+        );
+
+        let client = PeerClient {
+            state,
+            bitfield,
+            messages_sender,
+        };
+
+        Ok(Some(client))
+    }
+
+    pub async fn send_message(&self, message: Message) -> bool {
+        self.messages_sender.send(message).await.is_ok()
+    }
+
+    pub fn has_piece(&self, index: u32) -> Option<bool> {
+        self.bitfield.has(index)
     }
 }
 
-impl Deref for BasePeer {
-    type Target = Arc<PeerState>;
+impl Deref for PeerClient {
+    type Target = PeerState;
 
     fn deref(&self) -> &Self::Target {
         &self.state
     }
 }
 
-pub struct PeerClient {
-    base: BasePeer,
-    requested_pieces: mpsc::Sender<RequestedPiece>,
-}
-
-impl PeerClient {
-    pub async fn start(
-        handshake: Arc<Handshake>,
-        mut stream: TcpStream,
-        total_pieces: u32,
-        channel_senders: ChannelSenders,
-    ) -> Result<Option<Self>, std::io::Error> {
-        if !accepted_handshake(handshake, &mut stream).await? {
-            return Ok(None);
-        }
-
-        todo!()
-    }
-
-    pub async fn request_piece(&self, index: u32, hash: HashPiece) -> bool {
-        let request = RequestedPiece { index, hash };
-
-        self.requested_pieces.send(request).await.is_ok()
-    }
-}
-
-impl Deref for PeerClient {
-    type Target = BasePeer;
-
-    fn deref(&self) -> &Self::Target {
-        &self.base
-    }
-}
-
 pub struct PeerServer {
-    base: BasePeer,
+    state: Arc<PeerState>,
+    // TODO: hashmap of (PeerAddr, client
+    // (communication channels to know where
+    // to send requested/canceled pieces????))
 }
 
 impl PeerServer {
     pub fn start(
+        handshake: Arc<Handshake>,
         listener: TcpListener,
-        total_pieces: u32,
-        channel_senders: ChannelSenders,
+        torrent: Arc<Torrent>,
+        senders: ServerSenders,
     ) -> Result<Self, std::io::Error> {
         todo!()
-    }
-
-    pub fn mark_available_piece(&self, index: u32) {
-        self.state.set_piece(index);
     }
 }
 
 impl Deref for PeerServer {
-    type Target = BasePeer;
+    type Target = PeerState;
 
     fn deref(&self) -> &Self::Target {
-        &self.base
+        &self.state
     }
 }
 
@@ -1015,7 +1219,7 @@ mod tests {
         let bitfield = assert_some!(PeerBitfield::from_bytes(30, raw));
 
         assert_eq!(bitfield.total_pieces, 30);
-        let pieces = bitfield.pieces.read().unwrap();
+        let pieces = bitfield.raw();
         assert_eq!(pieces.len(), 4);
         assert_eq!(pieces.as_slice(), raw);
     }
@@ -1084,13 +1288,14 @@ mod tests {
 
     #[test]
     fn overwrite_bitfield() {
-        let bitfield = PeerBitfield::new(16);
+        let raw = &[0b10010010, 0b10100101];
 
-        let raw = &[0xFF, 0xFF];
+        let bitfield = assert_some!(PeerBitfield::from_bytes(16, raw));
 
-        assert!(bitfield.overwrite(raw));
+        let new_raw = &[0b10011110, 0b10110101];
+        assert!(bitfield.append_overwrite(new_raw));
 
-        assert_eq!(bitfield.pieces.read().unwrap().as_slice(), raw);
+        assert_eq!(bitfield.raw(), new_raw);
     }
 
     #[test]
@@ -1099,12 +1304,12 @@ mod tests {
 
         let raw = &[0b10110110, 0b10110101];
 
-        assert!(!bitfield.overwrite(raw));
+        assert!(!bitfield.append_overwrite(raw));
 
         let bitfield = PeerBitfield::new(16);
 
         let raw = &[0b10110110];
 
-        assert!(!bitfield.overwrite(raw));
+        assert!(!bitfield.append_overwrite(raw));
     }
 }
