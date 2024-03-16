@@ -704,15 +704,17 @@ impl StreamWriter {
         msg.encode(&mut self.buffer);
     }
 
-    async fn send_buffered(&mut self) -> Result<(), tokio::io::Error> {
+    async fn send_buffered(&mut self) -> Result<bool, tokio::io::Error> {
         if !self.buffer.is_empty() {
-            self.writer.write_all(&self.buffer).await?;
-            self.writer.flush().await?;
-
-            self.buffer.clear();
+            return Ok(false);
         }
 
-        Ok(())
+        self.writer.write_all(&self.buffer).await?;
+        self.writer.flush().await?;
+
+        self.buffer.clear();
+
+        Ok(true)
     }
 }
 
@@ -742,15 +744,16 @@ async fn accepted_handshake(
     Ok(match_handshake)
 }
 
+const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(2000);
+
 fn spawn_sender(
     mut writer: StreamWriter,
     state: Arc<PeerState>,
     mut checker: StopperCheck,
     mut messages: mpsc::Receiver<Message>,
-    send_queue_timeout: Duration,
 ) {
     tokio::spawn(async move {
-        let mut send_queue_alert = interval(send_queue_timeout);
+        let mut queue_check = interval(QUEUE_CHECK_TIMEOUT);
 
         loop {
             let message = tokio::select! {
@@ -761,10 +764,17 @@ fn spawn_sender(
                         None => return,
                     }
                 }
-                _ = send_queue_alert.tick() => {
-                    if writer.send_buffered().await.is_err() {
-                        state.close();
-                        return;
+                _ = queue_check.tick() => {
+                    let flushed_buff = match writer.send_buffered().await {
+                        Ok(flushed_buff) => flushed_buff,
+                        Err(_) => return,
+                    };
+
+                    if !flushed_buff {
+                        writer.fill_buffer(Message::KeepAlive);
+                        if writer.send_buffered().await.is_err() {
+                            return;
+                        }
                     }
 
                     continue;
@@ -875,8 +885,7 @@ pub struct PeerClient {
 }
 
 impl PeerClient {
-    const BUFFERED_MESSAGES: usize = 20;
-    const SEND_QUEUE_TIMEOUT: Duration = Duration::from_millis(2000);
+    const BUFFERED_MESSAGES: usize = 40;
 
     pub async fn start(
         handshake: Arc<Handshake>,
@@ -897,13 +906,7 @@ impl PeerClient {
         let state = Arc::new(PeerState::new(actor));
         let bitfield = Arc::new(PeerBitfield::new(torrent.num_pieces() as u32));
 
-        spawn_sender(
-            writer,
-            state.clone(),
-            checker.clone(),
-            messages_receiver,
-            Self::SEND_QUEUE_TIMEOUT,
-        );
+        spawn_sender(writer, state.clone(), checker.clone(), messages_receiver);
 
         spawn_client_receiver(
             peer_addr,
