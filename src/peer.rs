@@ -773,7 +773,7 @@ fn spawn_sender(
                 }
                 _ = queue_check.tick() => {
                     match writer.send_buffered().await {
-                        Ok(StreamWrite::Sent) => continue,
+                        Ok(StreamWrite::Sent) => (),
                         Ok(StreamWrite::Empty) => {
                             writer.fill_buffer(Message::KeepAlive);
                             if writer.send_buffered().await.is_err() {
