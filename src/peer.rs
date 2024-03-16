@@ -688,6 +688,11 @@ impl StreamReader {
     }
 }
 
+enum StreamWrite {
+    Sent,
+    Empty,
+}
+
 struct StreamWriter {
     writer: tcp::OwnedWriteHalf,
     buffer: Vec<u8>,
@@ -704,9 +709,9 @@ impl StreamWriter {
         msg.encode(&mut self.buffer);
     }
 
-    async fn send_buffered(&mut self) -> Result<bool, tokio::io::Error> {
+    async fn send_buffered(&mut self) -> Result<StreamWrite, tokio::io::Error> {
         if !self.buffer.is_empty() {
-            return Ok(false);
+            return Ok(StreamWrite::Empty);
         }
 
         self.writer.write_all(&self.buffer).await?;
@@ -714,7 +719,7 @@ impl StreamWriter {
 
         self.buffer.clear();
 
-        Ok(true)
+        Ok(StreamWrite::Sent)
     }
 }
 
@@ -768,8 +773,8 @@ fn spawn_sender(
                 }
                 _ = queue_check.tick() => {
                     match writer.send_buffered().await {
-                        Ok(true) => continue,
-                        Ok(false) => {
+                        Ok(StreamWrite::Sent) => continue,
+                        Ok(StreamWrite::Empty) => {
                             writer.fill_buffer(Message::KeepAlive);
                             if writer.send_buffered().await.is_err() {
                                 return;
