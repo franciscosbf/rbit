@@ -3,7 +3,7 @@
 #![allow(unused_variables)]
 
 use std::{
-    ops::{Deref, RangeInclusive},
+    ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
@@ -725,24 +725,6 @@ fn split_stream(stream: TcpStream) -> (StreamReader, StreamWriter) {
     (stream_reader, stream_writer)
 }
 
-struct RwTrials {
-    trials: RangeInclusive<u64>,
-}
-
-impl RwTrials {
-    const MAX: u64 = 3;
-
-    fn new() -> Self {
-        Self {
-            trials: (1..=Self::MAX),
-        }
-    }
-
-    fn exceeded(&mut self) -> bool {
-        self.trials.next().is_none()
-    }
-}
-
 async fn accepted_handshake(
     handshake: Arc<Handshake>,
     stream: &mut TcpStream,
@@ -768,7 +750,6 @@ fn spawn_sender(
     send_queue_timeout: Duration,
 ) {
     tokio::spawn(async move {
-        let mut trials = RwTrials::new();
         let mut send_queue_alert = interval(send_queue_timeout);
 
         loop {
@@ -781,7 +762,7 @@ fn spawn_sender(
                     }
                 }
                 _ = send_queue_alert.tick() => {
-                    if writer.send_buffered().await.is_err() && trials.exceeded() {
+                    if writer.send_buffered().await.is_err() {
                         state.close();
                         return;
                     }
@@ -804,8 +785,6 @@ fn spawn_client_receiver(
     senders: ClientSenders,
 ) {
     tokio::spawn(async move {
-        let mut trials = RwTrials::new();
-
         loop {
             let message = match reader.next_message().await {
                 StreamRead::Received(message) => message,
@@ -818,12 +797,8 @@ fn spawn_client_receiver(
                     continue;
                 }
                 StreamRead::Error => {
-                    if trials.exceeded() {
-                        state.close();
-                        return;
-                    }
-
-                    continue;
+                    state.close();
+                    return;
                 }
             };
 
