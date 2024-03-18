@@ -14,7 +14,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp, TcpListener, TcpStream},
     sync::{mpsc, watch},
-    time::{interval, Interval},
+    time::{interval, timeout},
 };
 
 use crate::{file::FileBlock, InfoHash, PeerAddr, Torrent};
@@ -136,6 +136,7 @@ fn bitfield_chunks(total_pieces: u32) -> u32 {
     (total_pieces as f64 / 8.).ceil() as u32
 }
 
+#[derive(Debug)]
 struct BitfieldIndex {
     chunk_index: usize,
     offset: u32,
@@ -484,12 +485,8 @@ impl StopperActor {
 struct StopperCheck(watch::Receiver<bool>);
 
 impl StopperCheck {
-    async fn stopped_wait(&mut self) -> bool {
+    async fn stopped(&mut self) -> bool {
         self.0.changed().await.map(|_| true).unwrap_or(true)
-    }
-
-    fn stopped(&mut self) -> bool {
-        self.0.has_changed().unwrap_or(true)
     }
 }
 
@@ -502,7 +499,7 @@ fn stopper() -> (StopperActor, StopperCheck) {
     (actor, check)
 }
 
-pub struct PeerState {
+pub struct PeerStateInner {
     am_choking: Switch,
     peer_choking: Switch,
     am_interested: Switch,
@@ -511,7 +508,7 @@ pub struct PeerState {
     actor: StopperActor,
 }
 
-impl PeerState {
+impl PeerStateInner {
     fn new(actor: StopperActor) -> Self {
         Self {
             am_choking: Switch::new(true),
@@ -565,12 +562,12 @@ impl PeerState {
         self.actor.stop();
     }
 
-    pub fn peer_choking_us(&self) -> bool {
-        self.peer_choking.current()
+    pub fn am_choking_peer(&self) -> bool {
+        self.am_choking.current()
     }
 
-    pub fn am_interested_in_peer(&self) -> bool {
-        self.am_interested.current()
+    pub fn peer_interested(&self) -> bool {
+        self.peer_interested.current()
     }
 
     pub fn closed(&self) -> bool {
@@ -579,8 +576,29 @@ impl PeerState {
 }
 
 #[derive(Clone)]
+struct PeerState {
+    inner: Arc<PeerStateInner>,
+}
+
+impl PeerState {
+    fn new(actor: StopperActor) -> Self {
+        let inner = Arc::new(PeerStateInner::new(actor));
+
+        Self { inner }
+    }
+}
+
+impl Deref for PeerState {
+    type Target = PeerStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[derive(Clone)]
 pub struct BaseSenders {
-    pub request_pieces: mpsc::Sender<PieceBlockRequest>,
+    pub requested_pieces: mpsc::Sender<PieceBlockRequest>,
     pub canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
 }
 
@@ -597,7 +615,7 @@ impl ClientSenders {
         received_piece_blocks: mpsc::Sender<ClientReceivedPiece>,
     ) -> Self {
         let base = BaseSenders {
-            request_pieces,
+            requested_pieces: request_pieces,
             canceled_pieces,
         };
 
@@ -625,7 +643,7 @@ impl ServerSenders {
         canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
     ) -> Self {
         Self(BaseSenders {
-            request_pieces,
+            requested_pieces: request_pieces,
             canceled_pieces,
         })
     }
@@ -642,43 +660,39 @@ impl Deref for ServerSenders {
 enum StreamRead {
     Received(Message),
     Invalid,
-    TimedOut,
     Error,
 }
 
 struct StreamReader {
     reader: tcp::OwnedReadHalf,
-    heartbeat: Interval,
 }
 
 impl StreamReader {
-    const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(2000);
+    const R_MSG_TIMEOUT: Duration = Duration::from_millis(3000);
+    const R_MSG_TRIES: u64 = 3;
 
     fn new(reader: tcp::OwnedReadHalf) -> Self {
-        let heartbeat = interval(Self::HEARTBEAT_TIMEOUT);
-
-        Self { reader, heartbeat }
+        Self { reader }
     }
 
     async fn next_message(&mut self) -> StreamRead {
-        let msg_len = tokio::select! {
-            _ = self.heartbeat.tick() => return StreamRead::TimedOut,
-            result = self.reader.read_u32() => {
-                match result {
-                    Ok(msg_len) => msg_len,
-                    Err(_) => return StreamRead::Error,
-                }
-            }
+        let msg_len = match self.reader.read_u32().await {
+            Ok(msg_len) => msg_len,
+            Err(_) => return StreamRead::Error,
         };
 
         let mut raw = vec![0; msg_len as usize];
 
-        tokio::select! {
-            _ = self.heartbeat.tick() => return StreamRead::TimedOut,
-            result = self.reader.read_exact(&mut raw) => {
-                if result.is_err() {
-                    return StreamRead::Error;
-                }
+        if self.reader.read_exact(&mut raw).await.is_err() {
+            return StreamRead::Error;
+        }
+
+        let mut tries = 1..=Self::R_MSG_TRIES;
+        while let Ok(Err(_)) | Err(_) =
+            timeout(Self::R_MSG_TIMEOUT, self.reader.read_exact(&mut raw)).await
+        {
+            if tries.next().is_none() {
+                return StreamRead::Error;
             }
         }
 
@@ -707,6 +721,10 @@ impl StreamWriter {
 
     fn fill_buffer(&mut self, msg: Message) {
         msg.encode(&mut self.buffer);
+    }
+
+    fn buffer_len(&self) -> usize {
+        self.buffer.len()
     }
 
     async fn send_buffered(&mut self) -> Result<StreamWrite, tokio::io::Error> {
@@ -749,11 +767,12 @@ async fn accepted_handshake(
     Ok(match_handshake)
 }
 
-const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(1000);
+const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);
+const QUEUED_MSGS: usize = 10;
 
 fn spawn_sender(
     mut writer: StreamWriter,
-    state: Arc<PeerState>,
+    state: PeerState,
     mut checker: StopperCheck,
     mut messages: mpsc::Receiver<Message>,
 ) {
@@ -762,52 +781,55 @@ fn spawn_sender(
 
         loop {
             tokio::select! {
-                _ = checker.stopped_wait() => return,
+                _ = checker.stopped() => return,
                 maybe_message = messages.recv() => {
-                    let message = match maybe_message {
-                        Some(message) => message,
+                    match maybe_message {
+                        Some(message) => writer.fill_buffer(message),
                         None => return,
                     };
 
-                    writer.fill_buffer(message);
+                    if writer.buffer_len() < QUEUED_MSGS {
+                        continue;
+                    }
                 }
                 _ = queue_check.tick() => {
                     match writer.send_buffered().await {
-                        Ok(StreamWrite::Sent) => (),
-                        Ok(StreamWrite::Empty) => {
-                            writer.fill_buffer(Message::KeepAlive);
-                            if writer.send_buffered().await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(_) => return,
+                        Ok(StreamWrite::Sent) => continue,
+                        Ok(StreamWrite::Empty) => writer.fill_buffer(Message::KeepAlive),
+                        Err(_) => break,
                     }
                 }
             };
+
+            if writer.send_buffered().await.is_err() {
+                break;
+            }
         }
+
+        state.close();
     });
 }
 
 fn spawn_client_receiver(
     peer_addr: PeerAddr,
     mut reader: StreamReader,
-    state: Arc<PeerState>,
-    bitfield: Arc<PeerBitfield>,
+    state: PeerState,
+    bitfield: PeerBitfield,
     mut checker: StopperCheck,
     senders: ClientSenders,
 ) {
     tokio::spawn(async move {
         loop {
-            let message = match reader.next_message().await {
+            let read = tokio::select! {
+                _ = checker.stopped() => {
+                    return;
+                },
+                read = reader.next_message() => read,
+            };
+
+            let message = match read {
                 StreamRead::Received(message) => message,
                 StreamRead::Invalid => continue,
-                StreamRead::TimedOut => {
-                    if checker.stopped() {
-                        return;
-                    }
-
-                    continue;
-                }
                 StreamRead::Error => {
                     state.close();
                     return;
@@ -841,7 +863,7 @@ fn spawn_client_receiver(
                     }
                     .into();
 
-                    let _ = senders.request_pieces.send(request).await;
+                    let _ = senders.requested_pieces.send(request).await;
                 }
                 Message::Piece {
                     index,
@@ -881,8 +903,8 @@ fn spawn_client_receiver(
 }
 
 pub struct PeerClient {
-    state: Arc<PeerState>,
-    bitfield: Arc<PeerBitfield>,
+    state: PeerState,
+    bitfield: PeerBitfield,
     messages_sender: mpsc::Sender<Message>,
 }
 
@@ -905,8 +927,8 @@ impl PeerClient {
         let (reader, writer) = split_stream(stream);
         let (messages_sender, messages_receiver) = mpsc::channel(Self::BUFFERED_MESSAGES);
 
-        let state = Arc::new(PeerState::new(actor));
-        let bitfield = Arc::new(PeerBitfield::new(torrent.num_pieces() as u32));
+        let state = PeerState::new(actor);
+        let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
 
         spawn_sender(writer, state.clone(), checker.clone(), messages_receiver);
 
@@ -938,7 +960,7 @@ impl PeerClient {
 }
 
 impl Deref for PeerClient {
-    type Target = PeerState;
+    type Target = PeerStateInner;
 
     fn deref(&self) -> &Self::Target {
         &self.state
@@ -946,7 +968,7 @@ impl Deref for PeerClient {
 }
 
 pub struct PeerServer {
-    state: Arc<PeerState>,
+    state: Arc<PeerStateInner>,
     // TODO: hashmap of (PeerAddr, client
     // (communication channels to know where
     // to send requested/canceled pieces????))
@@ -964,7 +986,7 @@ impl PeerServer {
 }
 
 impl Deref for PeerServer {
-    type Target = PeerState;
+    type Target = PeerStateInner;
 
     fn deref(&self) -> &Self::Target {
         &self.state
@@ -977,7 +999,7 @@ mod tests {
 
     use crate::InfoHash;
 
-    use super::{Handshake, Message, PeerBitfield, PeerId};
+    use super::{bitfield_chunks, BitfieldIndex, Handshake, Message, PeerBitfield, PeerId};
 
     #[test]
     fn encode_handshake() {
@@ -1022,6 +1044,151 @@ mod tests {
             -RB0100-TPhjEUZd5yX2";
 
         assert_none!(Handshake::decode(raw));
+    }
+
+    #[test]
+    fn calc_number_of_bitfield_chunks() {
+        [1_u32, 2, 3, 6].iter().for_each(|&total_pieces| {
+            assert_eq!(1, bitfield_chunks(total_pieces));
+        });
+
+        assert_eq!(4, bitfield_chunks(32));
+
+        assert_eq!(5, bitfield_chunks(35));
+    }
+
+    #[test]
+    fn calc_bitfield_index() {
+        [
+            (0, 0, 7),
+            (3, 0, 4),
+            (8, 1, 7),
+            (14, 1, 1),
+            (15, 1, 0),
+            (17, 2, 6),
+        ]
+        .iter()
+        .for_each(|&(index, chunk_index, offset)| {
+            let bindex = BitfieldIndex::new(index);
+
+            assert_eq!(
+                bindex.chunk_index, chunk_index,
+                "failed with piece index `{}`",
+                index
+            );
+            assert_eq!(bindex.offset, offset, "failed with piece index `{}`", index);
+        });
+    }
+
+    #[test]
+    fn create_empty_peer_bitfield() {
+        let bitfield = PeerBitfield::new(42);
+
+        assert_eq!(bitfield.total_pieces, 42);
+        let pieces = bitfield.pieces.read().unwrap();
+        assert_eq!(pieces.len(), 6);
+        assert!(pieces.iter().all(|&chunk| chunk == 0));
+    }
+
+    #[test]
+    fn create_peer_bitfield_from_valid_raw_slice() {
+        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
+
+        let bitfield = assert_some!(PeerBitfield::from_bytes(30, raw));
+
+        assert_eq!(bitfield.total_pieces, 30);
+        let pieces = bitfield.raw();
+        assert_eq!(pieces.len(), 4);
+        assert_eq!(pieces.as_slice(), raw);
+    }
+
+    #[test]
+    fn create_peer_bitfield_from_valid_raw_slice_with_number_of_pieces_multiple_of_8() {
+        let raw = &[0b10110110, 0b10110111, 0b01010011];
+
+        assert_some!(PeerBitfield::from_bytes(24, raw));
+    }
+
+    #[test]
+    fn create_peer_bitfield_from_invalid_raw_slice() {
+        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
+
+        assert_none!(PeerBitfield::from_bytes(27, raw));
+    }
+
+    #[test]
+    fn create_peer_bitfield_from_invalid_pieces_length_with_raw_slice() {
+        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
+
+        assert_none!(PeerBitfield::from_bytes(16, raw));
+    }
+
+    #[test]
+    fn check_pieces_set_in_peer_bitfield() {
+        let raw = &[0b10010010, 0b10100101];
+
+        let bitfield = assert_some!(PeerBitfield::from_bytes(16, raw));
+
+        assert_none!(bitfield.has(16));
+        assert_none!(bitfield.has(69));
+
+        [0, 3, 6, 8, 10, 13, 15].iter().for_each(|&index| {
+            assert_some_eq!(
+                bitfield.has(index),
+                true,
+                "failed with pice of index {}",
+                index
+            );
+        });
+    }
+
+    #[test]
+    fn mark_pieces_in_bitfield() {
+        let bitfield = PeerBitfield::new(24);
+
+        bitfield.set(24);
+        bitfield.set(65);
+
+        assert_eq!(bitfield.pieces.read().unwrap().as_slice(), &[0, 0, 0]);
+
+        [0, 3, 6, 8, 10, 13, 15, 16, 18, 23]
+            .iter()
+            .for_each(|&index| {
+                bitfield.set(index);
+
+                assert!(
+                    bitfield.has(index).unwrap(),
+                    "pice of index {} isn't set",
+                    index
+                );
+            });
+    }
+
+    #[test]
+    fn overwrite_bitfield() {
+        let raw = &[0b10010010, 0b10100101];
+
+        let bitfield = assert_some!(PeerBitfield::from_bytes(16, raw));
+
+        let new_raw = &[0b10011110, 0b10110101];
+        assert!(bitfield.append_overwrite(new_raw));
+
+        assert_eq!(bitfield.raw(), new_raw);
+    }
+
+    #[test]
+    fn overwrite_bitfield_from_invalid_raw_slice() {
+        let bitfield = PeerBitfield::new(15);
+
+        let raw = &[0b10110110, 0b10110101];
+
+        assert!(!bitfield.append_overwrite(raw));
+
+        let bitfield = PeerBitfield::new(16);
+
+        let raw = &[0b10110110];
+
+        assert!(!bitfield.append_overwrite(raw));
     }
 
     #[test]
@@ -1232,114 +1399,15 @@ mod tests {
         assert_none!(Message::decode(b"\x69\x69"));
     }
 
-    #[test]
-    fn create_empty_peer_bitfield() {
-        let bitfield = PeerBitfield::new(42);
-
-        assert_eq!(bitfield.total_pieces, 42);
-        let pieces = bitfield.pieces.read().unwrap();
-        assert_eq!(pieces.len(), 6);
-        assert!(pieces.iter().all(|&chunk| chunk == 0));
-    }
-
-    #[test]
-    fn create_peer_bitfield_from_valid_raw_slice() {
-        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
-
-        let bitfield = assert_some!(PeerBitfield::from_bytes(30, raw));
-
-        assert_eq!(bitfield.total_pieces, 30);
-        let pieces = bitfield.raw();
-        assert_eq!(pieces.len(), 4);
-        assert_eq!(pieces.as_slice(), raw);
-    }
-
-    #[test]
-    fn create_peer_bitfield_from_valid_raw_slice_with_number_of_pieces_multiple_of_8() {
-        let raw = &[0b10110110, 0b10110111, 0b01010011];
-
-        assert_some!(PeerBitfield::from_bytes(24, raw));
-    }
-
-    #[test]
-    fn create_peer_bitfield_from_invalid_raw_slice() {
-        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
-
-        assert_none!(PeerBitfield::from_bytes(27, raw));
-    }
-
-    #[test]
-    fn create_peer_bitfield_from_invalid_pieces_length_with_raw_slice() {
-        let raw = &[0b10110110, 0b10110111, 0b01010011, 0b10110000];
-
-        assert_none!(PeerBitfield::from_bytes(16, raw));
-    }
-
-    #[test]
-    fn check_pieces_set_in_peer_bitfield() {
-        let raw = &[0b10010010, 0b10100101];
-
-        let bitfield = assert_some!(PeerBitfield::from_bytes(16, raw));
-
-        assert_none!(bitfield.has(16));
-        assert_none!(bitfield.has(69));
-
-        [0, 3, 6, 8, 10, 13, 15].iter().for_each(|&index| {
-            assert_some_eq!(
-                bitfield.has(index),
-                true,
-                "failed with pice of index {}",
-                index
-            );
-        });
-    }
-
-    #[test]
-    fn mark_pieces_in_bitfield() {
-        let bitfield = PeerBitfield::new(24);
-
-        bitfield.set(24);
-        bitfield.set(65);
-
-        assert_eq!(bitfield.pieces.read().unwrap().as_slice(), &[0, 0, 0]);
-
-        [0, 3, 6, 8, 10, 13, 15, 16, 18, 23]
-            .iter()
-            .for_each(|&index| {
-                bitfield.set(index);
-
-                assert!(
-                    bitfield.has(index).unwrap(),
-                    "pice of index {} isn't set",
-                    index
-                );
-            });
-    }
-
-    #[test]
-    fn overwrite_bitfield() {
-        let raw = &[0b10010010, 0b10100101];
-
-        let bitfield = assert_some!(PeerBitfield::from_bytes(16, raw));
-
-        let new_raw = &[0b10011110, 0b10110101];
-        assert!(bitfield.append_overwrite(new_raw));
-
-        assert_eq!(bitfield.raw(), new_raw);
-    }
-
-    #[test]
-    fn overwrite_bitfield_from_invalid_raw_slice() {
-        let bitfield = PeerBitfield::new(15);
-
-        let raw = &[0b10110110, 0b10110101];
-
-        assert!(!bitfield.append_overwrite(raw));
-
-        let bitfield = PeerBitfield::new(16);
-
-        let raw = &[0b10110110];
-
-        assert!(!bitfield.append_overwrite(raw));
-    }
+    // TODO:
+    // Switch
+    // StopperActor
+    // StopperCheck
+    // PeerState
+    // StreamReader
+    // StreamWriter
+    // accepted_handshake,
+    // spawn_sender,
+    // spawn_client_receiver
+    // PeerClient
 }
