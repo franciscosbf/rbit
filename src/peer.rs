@@ -497,8 +497,6 @@ fn stopper() -> (StopperActor, StopperCheck) {
 
 pub struct PeerStateInner {
     am_choking: Switch,
-    peer_choking: Switch,
-    am_interested: Switch,
     peer_interested: Switch,
     closed: Switch,
     actor: StopperActor,
@@ -508,8 +506,6 @@ impl PeerStateInner {
     fn new(actor: StopperActor) -> Self {
         Self {
             am_choking: Switch::new(true),
-            peer_choking: Switch::new(true),
-            am_interested: Switch::new(false),
             peer_interested: Switch::new(false),
             closed: Switch::new(false),
             actor,
@@ -522,22 +518,6 @@ impl PeerStateInner {
 
     fn am_unchoking(&self) {
         self.am_choking.unset();
-    }
-
-    fn peer_choking(&self) {
-        self.peer_choking.set();
-    }
-
-    fn peer_unchoking(&self) {
-        self.peer_choking.unset();
-    }
-
-    fn am_interest(&self) {
-        self.am_interested.set();
-    }
-
-    fn am_uninsterest(&self) {
-        self.am_interested.unset();
     }
 
     fn peer_interest(&self) {
@@ -991,11 +971,16 @@ impl Deref for PeerServer {
 
 #[cfg(test)]
 mod tests {
-    use claims::{assert_matches, assert_none, assert_some, assert_some_eq};
+    use std::time::Duration;
+
+    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
 
     use crate::InfoHash;
 
-    use super::{bitfield_chunks, BitfieldIndex, Handshake, Message, PeerBitfield, PeerId};
+    use super::{
+        bitfield_chunks, stopper, BitfieldIndex, Handshake, Message, PeerBitfield, PeerId,
+        PeerState, Switch,
+    };
 
     #[test]
     fn encode_handshake() {
@@ -1395,11 +1380,101 @@ mod tests {
         assert_none!(Message::decode(b"\x69\x69"));
     }
 
+    #[test]
+    fn change_switch() {
+        let switch = Switch::new(false);
+        assert!(!switch.current());
+
+        switch.set();
+        assert!(switch.current());
+
+        switch.unset();
+        assert!(!switch.current());
+    }
+
+    #[tokio::test]
+    async fn stopper_actor_perform_normal_stop() {
+        let timeout = Duration::from_secs(4);
+        let (actor, check) = stopper();
+
+        let mut c1 = check.clone();
+        let t1 = tokio::spawn(async move { tokio::time::timeout(timeout, c1.stopped()).await });
+
+        let mut c2 = check.clone();
+        let t2 = tokio::spawn(async move { tokio::time::timeout(timeout, c2.stopped()).await });
+
+        actor.stop();
+
+        let rt1 = assert_ok!(t1.await);
+        assert_ok!(rt1);
+
+        let rt2 = assert_ok!(t2.await);
+        assert_ok!(rt2);
+    }
+
+    #[tokio::test]
+    async fn stopper_actor_closes_channel_on_drop() {
+        let timeout = Duration::from_secs(4);
+        let (actor, check) = stopper();
+
+        let mut c1 = check.clone();
+        let t1 = tokio::spawn(async move { tokio::time::timeout(timeout, c1.stopped()).await });
+
+        let mut c2 = check.clone();
+        let t2 = tokio::spawn(async move { tokio::time::timeout(timeout, c2.stopped()).await });
+
+        std::mem::drop(actor);
+
+        let rt1 = assert_ok!(t1.await);
+        assert_ok!(rt1);
+
+        let rt2 = assert_ok!(t2.await);
+        assert_ok!(rt2);
+    }
+
+    #[test]
+    fn change_choking_in_peer_state() {
+        let (actor, _) = stopper();
+        let state = PeerState::new(actor);
+        assert!(state.am_choking_peer());
+
+        state.am_unchoking();
+        assert!(!state.am_choking_peer());
+
+        state.am_choking();
+        assert!(state.am_choking_peer());
+    }
+
+    #[test]
+    fn change_interest_in_peer_state() {
+        let (actor, _) = stopper();
+        let state = PeerState::new(actor);
+        assert!(!state.peer_interested());
+
+        state.peer_interest();
+        assert!(state.peer_interested());
+
+        state.peer_uninsterest();
+        assert!(!state.peer_interested());
+    }
+
+    #[tokio::test]
+    async fn mark_peer_as_closed_in_peer_state() {
+        let timeout = Duration::from_secs(4);
+        let (actor, mut check) = stopper();
+        let state = PeerState::new(actor);
+
+        let t = tokio::spawn(async move { tokio::time::timeout(timeout, check.stopped()).await });
+
+        state.close();
+
+        let rt = assert_ok!(t.await);
+        assert_ok!(rt);
+
+        assert!(state.closed());
+    }
+
     // TODO:
-    // Switch
-    // StopperActor
-    // StopperCheck
-    // PeerState
     // StreamReader
     // StreamWriter
     // accepted_handshake,
