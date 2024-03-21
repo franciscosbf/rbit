@@ -659,8 +659,6 @@ struct StreamReader {
 }
 
 impl StreamReader {
-    const R_MSG_TRIES: u64 = 3;
-
     fn new(reader: tcp::OwnedReadHalf, buff_max_size: u32) -> Self {
         Self {
             reader,
@@ -677,11 +675,8 @@ impl StreamReader {
 
         let mut raw = vec![0; msg_len as usize];
 
-        let mut tries = 1..=Self::R_MSG_TRIES;
-        while self.reader.read_exact(&mut raw).await.is_err() {
-            if tries.next().is_none() {
-                return StreamRead::NotReceived;
-            }
+        if self.reader.read_exact(&mut raw).await.is_err() {
+            return StreamRead::NotReceived;
         }
 
         Message::decode(&raw)
@@ -1598,7 +1593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_reader_did_not_receive_any_message() {
+    async fn stream_reader_did_not_receive_anything_from_supposed_message() {
         validate_stream_reader(
             |mut sreader| {
                 async move {
@@ -1612,7 +1607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_reader_exceeds_tries() {
+    async fn stream_reader_did_not_receive_message_content() {
         validate_stream_reader(
             |mut sreader| {
                 async move {
