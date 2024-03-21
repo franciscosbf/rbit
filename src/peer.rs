@@ -633,6 +633,7 @@ impl Deref for ServerSenders {
     }
 }
 
+#[derive(Debug)]
 enum StreamRead {
     Received(Message),
     Invalid,
@@ -658,10 +659,6 @@ impl StreamReader {
         };
 
         let mut raw = vec![0; msg_len as usize];
-
-        if self.reader.read_exact(&mut raw).await.is_err() {
-            return StreamRead::Error;
-        }
 
         let mut tries = 1..=Self::R_MSG_TRIES;
         while let Ok(Err(_)) | Err(_) =
@@ -974,12 +971,13 @@ mod tests {
     use std::time::Duration;
 
     use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
+    use tokio::io::AsyncWriteExt;
 
     use crate::InfoHash;
 
     use super::{
         bitfield_chunks, stopper, BitfieldIndex, Handshake, Message, PeerBitfield, PeerId,
-        PeerState, Switch,
+        PeerState, StreamRead, StreamReader, Switch,
     };
 
     #[test]
@@ -1472,6 +1470,58 @@ mod tests {
         assert_ok!(rt);
 
         assert!(state.closed());
+    }
+
+    #[tokio::test]
+    async fn stream_reader_reads_message() {
+        let timeout = Duration::from_secs(6);
+        let client_listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
+        let port = client_listener.local_addr().unwrap().port();
+
+        let tcli = tokio::spawn(async move {
+            let accept_result = tokio::time::timeout(timeout, client_listener.accept())
+                .await
+                .unwrap();
+
+            let (stream, _) = assert_ok!(accept_result);
+            let (reader, _) = stream.into_split();
+            let mut sreader = StreamReader::new(reader);
+
+            let msg = match sreader.next_message().await {
+                StreamRead::Received(msg) => msg,
+                other => panic!("StreamReader received: {:?}", other),
+            };
+
+            assert_matches!(
+                msg,
+                Message::Request {
+                    index: 0,
+                    begin: 1024,
+                    length: 2048,
+                }
+            );
+        });
+
+        let tpeer = tokio::spawn(async move {
+            let mut peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
+                .await
+                .unwrap();
+
+            let (_, mut writer) = peer_stream.split();
+            let message = Message::Request {
+                index: 0,
+                begin: 1024,
+                length: 2048,
+            };
+            let mut buff = vec![];
+            message.encode(&mut buff);
+
+            assert_ok!(writer.write_all(&buff).await);
+        });
+
+        assert_ok!(tcli.await);
+
+        assert_ok!(tpeer.await);
     }
 
     // TODO:
