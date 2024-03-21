@@ -650,6 +650,7 @@ enum StreamRead {
     Received(Message),
     Invalid,
     Error,
+    NotReceived,
 }
 
 struct StreamReader {
@@ -658,7 +659,6 @@ struct StreamReader {
 }
 
 impl StreamReader {
-    const R_MSG_TIMEOUT: Duration = Duration::from_millis(3000);
     const R_MSG_TRIES: u64 = 3;
 
     fn new(reader: tcp::OwnedReadHalf, buff_max_size: u32) -> Self {
@@ -671,17 +671,16 @@ impl StreamReader {
     async fn next_message(&mut self) -> StreamRead {
         let msg_len = match self.reader.read_u32().await {
             Ok(msg_len) if msg_len <= self.buff_max_size => msg_len,
-            Ok(_) | Err(_) => return StreamRead::Error,
+            Ok(_) => return StreamRead::Error,
+            Err(_) => return StreamRead::NotReceived,
         };
 
         let mut raw = vec![0; msg_len as usize];
 
         let mut tries = 1..=Self::R_MSG_TRIES;
-        while let Ok(Err(_)) | Err(_) =
-            timeout(Self::R_MSG_TIMEOUT, self.reader.read_exact(&mut raw)).await
-        {
+        while self.reader.read_exact(&mut raw).await.is_err() {
             if tries.next().is_none() {
-                return StreamRead::Error;
+                return StreamRead::NotReceived;
             }
         }
 
@@ -819,7 +818,7 @@ fn spawn_client_receiver(
             let message = match read {
                 StreamRead::Received(message) => message,
                 StreamRead::Invalid => continue,
-                StreamRead::Error => {
+                StreamRead::Error | StreamRead::NotReceived => {
                     state.close();
                     return;
                 }
@@ -995,11 +994,13 @@ mod tests {
     use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::io::AsyncWriteExt;
 
+    use futures::future::{BoxFuture, FutureExt};
+
     use crate::InfoHash;
 
     use super::{
         bitfield_chunks, stopper, BitfieldIndex, Handshake, Message, PeerBitfield, PeerId,
-        PeerState, StreamRead, StreamReader, Switch,
+        PeerState, StopperActor, StopperCheck, StreamRead, StreamReader, Switch,
     };
 
     #[test]
@@ -1414,8 +1415,10 @@ mod tests {
         assert!(!switch.current());
     }
 
-    #[tokio::test]
-    async fn stopper_actor_perform_normal_stop() {
+    async fn validate_stopper<F>(action: F)
+    where
+        F: FnOnce(StopperActor),
+    {
         let timeout = Duration::from_secs(4);
         let (actor, check) = stopper();
 
@@ -1425,39 +1428,41 @@ mod tests {
         let mut c2 = check.clone();
         let t2 = tokio::spawn(async move { tokio::time::timeout(timeout, c2.stopped()).await });
 
-        actor.stop();
+        action(actor);
 
         let rt1 = assert_ok!(t1.await);
         assert_ok!(rt1);
 
         let rt2 = assert_ok!(t2.await);
         assert_ok!(rt2);
+    }
+
+    #[tokio::test]
+    async fn stopper_actor_perform_normal_stop() {
+        validate_stopper(|actor| {
+            actor.stop();
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn stopper_actor_closes_channel_on_drop() {
-        let timeout = Duration::from_secs(4);
-        let (actor, check) = stopper();
+        validate_stopper(|actor| {
+            std::mem::drop(actor);
+        })
+        .await;
+    }
 
-        let mut c1 = check.clone();
-        let t1 = tokio::spawn(async move { tokio::time::timeout(timeout, c1.stopped()).await });
+    fn new_peer_state() -> PeerState {
+        let (actor, _) = stopper();
 
-        let mut c2 = check.clone();
-        let t2 = tokio::spawn(async move { tokio::time::timeout(timeout, c2.stopped()).await });
-
-        std::mem::drop(actor);
-
-        let rt1 = assert_ok!(t1.await);
-        assert_ok!(rt1);
-
-        let rt2 = assert_ok!(t2.await);
-        assert_ok!(rt2);
+        PeerState::new(actor)
     }
 
     #[test]
     fn change_choking_in_peer_state() {
-        let (actor, _) = stopper();
-        let state = PeerState::new(actor);
+        let state = new_peer_state();
+
         assert!(state.am_choking_peer());
 
         state.am_unchoking();
@@ -1469,8 +1474,8 @@ mod tests {
 
     #[test]
     fn change_interest_in_peer_state() {
-        let (actor, _) = stopper();
-        let state = PeerState::new(actor);
+        let state = new_peer_state();
+
         assert!(!state.peer_interested());
 
         state.peer_interest();
@@ -1496,51 +1501,37 @@ mod tests {
         assert!(state.closed());
     }
 
-    #[tokio::test]
-    async fn stream_reader_reads_message() {
-        let timeout = Duration::from_secs(6);
+    const STREAM_READER_TIMEOUT: Duration = Duration::from_secs(4);
+
+    async fn validate_stream_reader<CF, PF>(cli_action: CF, peer_action: PF)
+    where
+        CF: FnOnce(StreamReader) -> BoxFuture<'static, ()> + Send + 'static,
+        PF: FnOnce(tokio::net::tcp::OwnedWriteHalf) -> BoxFuture<'static, ()> + Send + 'static,
+    {
         let client_listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
         let port = client_listener.local_addr().unwrap().port();
 
         let tcli = tokio::spawn(async move {
-            let accept_result = tokio::time::timeout(timeout, client_listener.accept())
-                .await
-                .unwrap();
+            let accept_result =
+                tokio::time::timeout(STREAM_READER_TIMEOUT, client_listener.accept())
+                    .await
+                    .unwrap();
 
             let (stream, _) = assert_ok!(accept_result);
             let (reader, _) = stream.into_split();
-            let mut sreader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ);
+            let sreader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ);
 
-            let msg = match sreader.next_message().await {
-                StreamRead::Received(msg) => msg,
-                other => panic!("StreamReader received: {:?}", other),
-            };
-
-            assert_matches!(
-                msg,
-                Message::Request {
-                    index: 0,
-                    begin: 1024,
-                    length: 2048,
-                }
-            );
+            cli_action(sreader).await;
         });
 
         let tpeer = tokio::spawn(async move {
-            let mut peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
+            let peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
                 .await
                 .unwrap();
 
-            let (_, mut writer) = peer_stream.split();
-            let message = Message::Request {
-                index: 0,
-                begin: 1024,
-                length: 2048,
-            };
-            let mut buff = vec![];
-            message.encode(&mut buff);
+            let (_, writer) = peer_stream.into_split();
 
-            assert_ok!(writer.write_all(&buff).await);
+            peer_action(writer).await;
         });
 
         assert_ok!(tcli.await);
@@ -1548,8 +1539,117 @@ mod tests {
         assert_ok!(tpeer.await);
     }
 
+    #[tokio::test]
+    async fn stream_reader_reads_message() {
+        validate_stream_reader(
+            |mut sreader| {
+                async move {
+                    let msg = match sreader.next_message().await {
+                        StreamRead::Received(msg) => msg,
+                        other => panic!("StreamReader received: {:?}", other),
+                    };
+
+                    assert_matches!(
+                        msg,
+                        Message::Request {
+                            index: 0,
+                            begin: 1024,
+                            length: 2048,
+                        }
+                    );
+                }
+                .boxed()
+            },
+            |mut writer| {
+                async move {
+                    let message = Message::Request {
+                        index: 0,
+                        begin: 1024,
+                        length: 2048,
+                    };
+                    let mut buff = vec![];
+                    message.encode(&mut buff);
+
+                    assert_ok!(writer.write_all(&buff).await);
+                }
+                .boxed()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_reader_reads_message_greater_than_buff() {
+        validate_stream_reader(
+            |mut sreader| {
+                async move {
+                    assert_matches!(sreader.next_message().await, StreamRead::Error);
+                }
+                .boxed()
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_u32(Message::MAX_STATIC_MSG_SZ + 1).await);
+                }
+                .boxed()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_reader_did_not_receive_any_message() {
+        validate_stream_reader(
+            |mut sreader| {
+                async move {
+                    assert_matches!(sreader.next_message().await, StreamRead::NotReceived);
+                }
+                .boxed()
+            },
+            |_| async move {}.boxed(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_reader_exceeds_tries() {
+        validate_stream_reader(
+            |mut sreader| {
+                async move {
+                    assert_matches!(sreader.next_message().await, StreamRead::NotReceived);
+                }
+                .boxed()
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_u32(8).await);
+                }
+                .boxed()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_reader_reads_invalid_message() {
+        validate_stream_reader(
+            |mut sreader| {
+                async move {
+                    assert_matches!(sreader.next_message().await, StreamRead::Invalid);
+                }
+                .boxed()
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x02\xdf\x23").await);
+                }
+                .boxed()
+            },
+        )
+        .await;
+    }
+
     // TODO:
-    // StreamReader
     // StreamWriter
     // accepted_handshake,
     // spawn_sender,
