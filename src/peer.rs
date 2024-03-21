@@ -165,6 +165,7 @@ fn valid_bitfield(total_pieces: u32, raw: &[u8]) -> bool {
 pub struct PeerBitfieldInner {
     total_pieces: u32,
     pieces: RwLock<Vec<u8>>,
+    num_chunks: u32,
 }
 
 impl PeerBitfieldInner {
@@ -209,6 +210,10 @@ impl PeerBitfieldInner {
     pub fn raw(&self) -> Vec<u8> {
         self.pieces.read().unwrap().clone()
     }
+
+    fn num_chunks(&self) -> u32 {
+        self.num_chunks
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -218,12 +223,13 @@ pub struct PeerBitfield {
 
 impl PeerBitfield {
     pub fn new(total_pieces: u32) -> Self {
-        let length = bitfield_chunks(total_pieces);
-        let pieces = RwLock::new(vec![0; length as usize]);
+        let num_chunks = bitfield_chunks(total_pieces);
+        let pieces = RwLock::new(vec![0; num_chunks as usize]);
 
         let inner = Arc::new(PeerBitfieldInner {
             total_pieces,
             pieces,
+            num_chunks,
         });
 
         Self { inner }
@@ -235,9 +241,11 @@ impl PeerBitfield {
         }
 
         let pieces = RwLock::new(raw.to_vec());
+        let num_chunks = bitfield_chunks(total_pieces);
         let inner = Arc::new(PeerBitfieldInner {
             total_pieces,
             pieces,
+            num_chunks,
         });
         let bitfield = PeerBitfield { inner };
 
@@ -284,6 +292,10 @@ pub enum Message {
 }
 
 impl Message {
+    const MAX_STATIC_MSG_SZ: u32 = 13;
+
+    pub const MAX_PIECE_CHUNK_SZ: u32 = 32768;
+
     fn encode(self, buff: &mut Vec<u8>) {
         match self {
             Message::KeepAlive => buff.extend_from_slice(&[0, 0, 0, 0]),
@@ -642,20 +654,24 @@ enum StreamRead {
 
 struct StreamReader {
     reader: tcp::OwnedReadHalf,
+    buff_max_size: u32,
 }
 
 impl StreamReader {
     const R_MSG_TIMEOUT: Duration = Duration::from_millis(3000);
     const R_MSG_TRIES: u64 = 3;
 
-    fn new(reader: tcp::OwnedReadHalf) -> Self {
-        Self { reader }
+    fn new(reader: tcp::OwnedReadHalf, buff_max_size: u32) -> Self {
+        Self {
+            reader,
+            buff_max_size,
+        }
     }
 
     async fn next_message(&mut self) -> StreamRead {
         let msg_len = match self.reader.read_u32().await {
-            Ok(msg_len) => msg_len,
-            Err(_) => return StreamRead::Error,
+            Ok(msg_len) if msg_len <= self.buff_max_size => msg_len,
+            Ok(_) | Err(_) => return StreamRead::Error,
         };
 
         let mut raw = vec![0; msg_len as usize];
@@ -714,10 +730,10 @@ impl StreamWriter {
     }
 }
 
-fn split_stream(stream: TcpStream) -> (StreamReader, StreamWriter) {
+fn split_stream(stream: TcpStream, reader_buff_max_size: u32) -> (StreamReader, StreamWriter) {
     let (reader, writer) = stream.into_split();
 
-    let stream_reader = StreamReader::new(reader);
+    let stream_reader = StreamReader::new(reader, reader_buff_max_size);
     let stream_writer = StreamWriter::new(writer);
 
     (stream_reader, stream_writer)
@@ -894,14 +910,20 @@ impl PeerClient {
             return Ok(None);
         }
 
+        let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
+
         let peer_addr = stream.peer_addr().unwrap().into();
 
-        let (actor, checker) = stopper();
-        let (reader, writer) = split_stream(stream);
-        let (messages_sender, messages_receiver) = mpsc::channel(Self::BUFFERED_MESSAGES);
+        let reader_buff_max_size = ((Message::MAX_PIECE_CHUNK_SZ as u64).min(torrent.piece_size)
+            as u32)
+            .max(bitfield.num_chunks())
+            .max(Message::MAX_STATIC_MSG_SZ);
 
+        let (actor, checker) = stopper();
         let state = PeerState::new(actor);
-        let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
+
+        let (reader, writer) = split_stream(stream, reader_buff_max_size);
+        let (messages_sender, messages_receiver) = mpsc::channel(Self::BUFFERED_MESSAGES);
 
         spawn_sender(writer, state.clone(), checker.clone(), messages_receiver);
 
@@ -1064,8 +1086,9 @@ mod tests {
         let bitfield = PeerBitfield::new(42);
 
         assert_eq!(bitfield.total_pieces, 42);
-        let pieces = bitfield.pieces.read().unwrap();
-        assert_eq!(pieces.len(), 6);
+        assert_eq!(bitfield.num_chunks(), 6);
+        let pieces = bitfield.raw();
+        assert_eq!(bitfield.num_chunks(), pieces.len() as u32);
         assert!(pieces.iter().all(|&chunk| chunk == 0));
     }
 
@@ -1076,8 +1099,9 @@ mod tests {
         let bitfield = assert_some!(PeerBitfield::from_bytes(30, raw));
 
         assert_eq!(bitfield.total_pieces, 30);
+        assert_eq!(bitfield.num_chunks(), 4);
         let pieces = bitfield.raw();
-        assert_eq!(pieces.len(), 4);
+        assert_eq!(bitfield.num_chunks(), pieces.len() as u32);
         assert_eq!(pieces.as_slice(), raw);
     }
 
@@ -1485,7 +1509,7 @@ mod tests {
 
             let (stream, _) = assert_ok!(accept_result);
             let (reader, _) = stream.into_split();
-            let mut sreader = StreamReader::new(reader);
+            let mut sreader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ);
 
             let msg = match sreader.next_message().await {
                 StreamRead::Received(msg) => msg,
