@@ -1,7 +1,3 @@
-// TODO: remove
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
 use std::{
     ops::Deref,
     sync::{
@@ -1294,8 +1290,8 @@ mod tests {
         let msg = assert_some!(Message::decode(
             b"\x05\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95"
         ));
-        let pieces = b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95".to_vec();
-        assert_matches!(msg, Message::Bitfield { pieces });
+        let expected_pieces = b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95".to_vec();
+        assert_matches!(msg, Message::Bitfield { pieces } if pieces == expected_pieces);
     }
 
     #[test]
@@ -1352,14 +1348,14 @@ mod tests {
             b"\x07\x00\x00\x00\x2b\x00\x00\x00\x17\
                 \xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95"
         ));
-        let block = b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95".to_vec();
+        let expected_block = b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95".to_vec();
         assert_matches!(
             msg,
             Message::Piece {
                 index: 43,
                 begin: 23,
                 block,
-            }
+            } if block == expected_block
         );
     }
 
