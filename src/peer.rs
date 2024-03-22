@@ -10,7 +10,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp, TcpListener, TcpStream},
     sync::{mpsc, watch},
-    time::{interval, timeout},
+    time::timeout,
 };
 
 use crate::{file::FileBlock, InfoHash, PeerAddr, Torrent};
@@ -702,25 +702,12 @@ impl StreamWriter {
         Self { writer, buffer }
     }
 
-    fn fill_buffer(&mut self, msg: Message) {
+    async fn send(&mut self, msg: Message) -> tokio::io::Result<()> {
         msg.encode(&mut self.buffer);
-    }
-
-    fn buffer_len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    async fn send_buffered(&mut self) -> Result<StreamWrite, tokio::io::Error> {
-        if !self.buffer.is_empty() {
-            return Ok(StreamWrite::Empty);
-        }
-
-        self.writer.write_all(&self.buffer).await?;
-        self.writer.flush().await?;
-
+        let result = self.writer.write_all(&self.buffer).await;
         self.buffer.clear();
 
-        Ok(StreamWrite::Sent)
+        result
     }
 }
 
@@ -751,7 +738,6 @@ async fn accepted_handshake(
 }
 
 const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);
-const QUEUED_MSGS: usize = 10;
 
 fn spawn_sender(
     mut writer: StreamWriter,
@@ -760,32 +746,20 @@ fn spawn_sender(
     mut messages: mpsc::Receiver<Message>,
 ) {
     tokio::spawn(async move {
-        let mut queue_check = interval(QUEUE_CHECK_TIMEOUT);
-
         loop {
             tokio::select! {
                 _ = checker.stopped() => return,
-                maybe_message = messages.recv() => {
-                    match maybe_message {
-                        Some(message) => writer.fill_buffer(message),
-                        None => return,
+                result = timeout(QUEUE_CHECK_TIMEOUT, messages.recv()) => {
+                    let message = match result {
+                        Ok(Some(message)) => message,
+                        Err(_timeout) => Message::KeepAlive,
+                        Ok(None) => break,
                     };
 
-                    if writer.buffer_len() < QUEUED_MSGS {
-                        continue;
+                    if writer.send(message).await.is_err() {
+                        break;
                     }
                 }
-                _ = queue_check.tick() => {
-                    match writer.send_buffered().await {
-                        Ok(StreamWrite::Sent) => continue,
-                        Ok(StreamWrite::Empty) => writer.fill_buffer(Message::KeepAlive),
-                        Err(_) => break,
-                    }
-                }
-            };
-
-            if writer.send_buffered().await.is_err() {
-                break;
             }
         }
 
