@@ -1791,7 +1791,6 @@ mod tests {
     }
 
     // TODO:
-    // accepted_handshake,
     // spawn_sender,
     // spawn_client_receiver
     // PeerClient
