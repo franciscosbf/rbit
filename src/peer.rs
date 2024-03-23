@@ -1481,12 +1481,10 @@ mod tests {
         let port = client_listener.local_addr().unwrap().port();
 
         let tcli = tokio::spawn(async move {
-            let accept_result =
-                tokio::time::timeout(STREAM_READER_TIMEOUT, client_listener.accept())
-                    .await
-                    .unwrap();
-
-            let (stream, _) = assert_ok!(accept_result);
+            let (stream, _) = tokio::time::timeout(STREAM_READER_TIMEOUT, client_listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
             let (reader, _) = stream.into_split();
             let sreader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ);
 
