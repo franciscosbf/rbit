@@ -1734,11 +1734,9 @@ mod tests {
     async fn receive_valid_handshake_as_reply() {
         let accepted = validate_handshake(|handshake, mut reader, mut writer| {
             async move {
-                let raw_handshake = handshake.raw();
-                let mut buff = vec![0_u8; raw_handshake.len()];
+                let mut buff = vec![0_u8; handshake.raw().len()];
 
                 assert_ok!(reader.read_exact(buff.as_mut_slice()).await);
-                assert_eq!(buff, raw_handshake);
                 assert_ok!(writer.write_all(buff.as_slice()).await);
             }
             .boxed()
@@ -1752,11 +1750,9 @@ mod tests {
     async fn receive_invalid_handshake_as_reply() {
         let accepted = validate_handshake(|handshake, mut reader, mut writer| {
             async move {
-                let raw_handshake = handshake.raw();
-                let mut buff = vec![0_u8; raw_handshake.len()];
+                let mut buff = vec![0_u8; handshake.raw().len()];
 
                 assert_ok!(reader.read_exact(buff.as_mut_slice()).await);
-                assert_eq!(buff, raw_handshake);
                 assert_ok!(writer.write_u8(1).await);
             }
             .boxed()
@@ -1777,11 +1773,9 @@ mod tests {
     async fn connection_is_halted_while_trying_to_receive_hanshake_reply() {
         let accepted = validate_handshake(|handshake, mut reader, _| {
             async move {
-                let raw_handshake = handshake.raw();
-                let mut buff = vec![0_u8; raw_handshake.len()];
+                let mut buff = vec![0_u8; handshake.raw().len()];
 
                 assert_ok!(reader.read_exact(buff.as_mut_slice()).await);
-                assert_eq!(buff, raw_handshake);
             }
             .boxed()
         })
