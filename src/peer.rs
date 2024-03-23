@@ -685,11 +685,6 @@ impl StreamReader {
     }
 }
 
-enum StreamWrite {
-    Sent,
-    Empty,
-}
-
 struct StreamWriter {
     writer: tcp::OwnedWriteHalf,
     buffer: Vec<u8>,
