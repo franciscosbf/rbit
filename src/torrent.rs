@@ -228,7 +228,7 @@ impl TryFrom<Vec<u8>> for HashPieces {
 pub struct InfoHash(pub [u8; 20]);
 
 impl InfoHash {
-    fn hash(raw_info: &[u8]) -> Self {
+    pub fn hash(raw_info: &[u8]) -> Self {
         Self(Sha1::digest(raw_info).into())
     }
 }

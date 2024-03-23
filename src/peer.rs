@@ -715,21 +715,20 @@ fn split_stream(stream: TcpStream, reader_buff_max_size: u32) -> (StreamReader, 
     (stream_reader, stream_writer)
 }
 
-async fn accepted_handshake(
-    handshake: Arc<Handshake>,
-    stream: &mut TcpStream,
-) -> Result<bool, std::io::Error> {
+async fn accepted_handshake(handshake: Arc<Handshake>, stream: &mut TcpStream) -> bool {
     let raw = handshake.raw();
 
-    stream.write_all(raw).await?;
+    if stream.write_all(raw).await.is_err() {
+        return false;
+    }
 
     let mut handshake_reply = vec![0; raw.len()];
 
-    stream.read_exact(&mut handshake_reply).await?;
+    if stream.read_exact(&mut handshake_reply).await.is_err() {
+        return false;
+    }
 
-    let match_handshake = raw == handshake_reply;
-
-    Ok(match_handshake)
+    true
 }
 
 const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -868,9 +867,9 @@ impl PeerClient {
         mut stream: TcpStream,
         torrent: Arc<Torrent>,
         senders: ClientSenders,
-    ) -> Result<Option<Self>, std::io::Error> {
-        if !accepted_handshake(handshake, &mut stream).await? {
-            return Ok(None);
+    ) -> Option<Self> {
+        if !accepted_handshake(handshake, &mut stream).await {
+            return None;
         }
 
         let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
@@ -905,7 +904,7 @@ impl PeerClient {
             messages_sender,
         };
 
-        Ok(Some(client))
+        Some(client)
     }
 
     pub async fn send_message(&self, message: Message) -> bool {
@@ -953,9 +952,12 @@ impl Deref for PeerServer {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
-    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
+    use claims::{
+        assert_err, assert_matches, assert_none, assert_ok, assert_ok_eq, assert_some,
+        assert_some_eq,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use futures::future::{BoxFuture, FutureExt};
@@ -963,8 +965,9 @@ mod tests {
     use crate::InfoHash;
 
     use super::{
-        bitfield_chunks, stopper, BitfieldIndex, Handshake, Message, PeerBitfield, PeerId,
-        PeerState, StopperActor, StreamRead, StreamReader, StreamWriter, Switch,
+        accepted_handshake, bitfield_chunks, stopper, BitfieldIndex, Handshake, Message,
+        PeerBitfield, PeerId, PeerState, StopperActor, StreamRead, StreamReader, StreamWriter,
+        Switch,
     };
 
     #[test]
@@ -1683,6 +1686,108 @@ mod tests {
             },
         )
         .await;
+    }
+
+    async fn validate_handshake<PF>(peer_reply: PF) -> bool
+    where
+        PF: FnOnce(
+                Arc<Handshake>,
+                tokio::net::tcp::OwnedReadHalf,
+                tokio::net::tcp::OwnedWriteHalf,
+            ) -> BoxFuture<'static, ()>
+            + Send
+            + 'static,
+    {
+        let client_listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
+        let port = client_listener.local_addr().unwrap().port();
+
+        let info_hash = InfoHash::hash(&[1, 2, 3, 4]);
+        let peer_id = PeerId::build();
+        let handshake = Arc::new(Handshake::new(info_hash, peer_id));
+
+        let chandshake = Arc::clone(&handshake);
+        let tcli = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(STREAM_READER_TIMEOUT, client_listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+            accepted_handshake(chandshake, &mut stream).await
+        });
+
+        let tpeer = tokio::spawn(async move {
+            let peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
+                .await
+                .unwrap();
+            let (reader, writer) = peer_stream.into_split();
+
+            peer_reply(handshake, reader, writer).await;
+        });
+
+        assert_ok!(tpeer.await);
+
+        assert_ok!(tcli.await)
+    }
+
+    #[tokio::test]
+    async fn receive_valid_handshake_as_reply() {
+        let accepted = validate_handshake(|handshake, mut reader, mut writer| {
+            async move {
+                let raw_handshake = handshake.raw();
+                let mut buff = vec![0_u8; raw_handshake.len()];
+
+                assert_ok!(reader.read_exact(buff.as_mut_slice()).await);
+                assert_eq!(buff, raw_handshake);
+                assert_ok!(writer.write_all(buff.as_slice()).await);
+            }
+            .boxed()
+        })
+        .await;
+
+        assert!(accepted);
+    }
+
+    #[tokio::test]
+    async fn receive_invalid_handshake_as_reply() {
+        let accepted = validate_handshake(|handshake, mut reader, mut writer| {
+            async move {
+                let raw_handshake = handshake.raw();
+                let mut buff = vec![0_u8; raw_handshake.len()];
+
+                assert_ok!(reader.read_exact(buff.as_mut_slice()).await);
+                assert_eq!(buff, raw_handshake);
+                assert_ok!(writer.write_u8(1).await);
+            }
+            .boxed()
+        })
+        .await;
+
+        assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn connection_is_halted_while_trying_to_send_hanshake() {
+        let accepted = validate_handshake(|_, _, _| async move {}.boxed()).await;
+
+        assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn connection_is_halted_while_trying_to_receive_hanshake_reply() {
+        let accepted = validate_handshake(|handshake, mut reader, _| {
+            async move {
+                let raw_handshake = handshake.raw();
+                let mut buff = vec![0_u8; raw_handshake.len()];
+
+                assert_ok!(reader.read_exact(buff.as_mut_slice()).await);
+                assert_eq!(buff, raw_handshake);
+            }
+            .boxed()
+        })
+        .await;
+
+        assert!(!accepted);
     }
 
     // TODO:
