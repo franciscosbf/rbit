@@ -956,7 +956,7 @@ mod tests {
     use std::time::Duration;
 
     use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use futures::future::{BoxFuture, FutureExt};
 
@@ -964,7 +964,7 @@ mod tests {
 
     use super::{
         bitfield_chunks, stopper, BitfieldIndex, Handshake, Message, PeerBitfield, PeerId,
-        PeerState, StopperActor, StopperCheck, StreamRead, StreamReader, Switch,
+        PeerState, StopperActor, StreamRead, StreamReader, StreamWriter, Switch,
     };
 
     #[test]
@@ -1490,7 +1490,6 @@ mod tests {
             let peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
                 .await
                 .unwrap();
-
             let (_, writer) = peer_stream.into_split();
 
             peer_action(writer).await;
@@ -1611,8 +1610,82 @@ mod tests {
         .await;
     }
 
+    async fn validate_stream_writer<SF, PF>(server_action: SF, peer_action: PF)
+    where
+        SF: FnOnce(StreamWriter) -> BoxFuture<'static, ()> + Send + 'static,
+        PF: FnOnce(tokio::net::tcp::OwnedReadHalf) -> BoxFuture<'static, ()> + Send + 'static,
+    {
+        let client_listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
+        let port = client_listener.local_addr().unwrap().port();
+
+        let tpeer = tokio::spawn(async move {
+            let (stream, _) = tokio::time::timeout(STREAM_READER_TIMEOUT, client_listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (reader, _) = stream.into_split();
+
+            peer_action(reader).await;
+        });
+
+        let tsrv = tokio::spawn(async move {
+            let peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
+                .await
+                .unwrap();
+            let (_, writer) = peer_stream.into_split();
+            let stream_writer = StreamWriter::new(writer);
+
+            server_action(stream_writer).await;
+        });
+
+        assert_ok!(tpeer.await);
+
+        assert_ok!(tsrv.await);
+    }
+
+    #[tokio::test]
+    async fn stream_writer_sends_message() {
+        validate_stream_writer(
+            |mut swriter| {
+                async move {
+                    let msgs = [
+                        Message::Request {
+                            index: 43,
+                            begin: 23,
+                            length: 556,
+                        },
+                        Message::Unchoke,
+                    ];
+
+                    for msg in msgs {
+                        assert_ok!(swriter.send(msg).await);
+                    }
+                }
+                .boxed()
+            },
+            |mut reader| {
+                async move {
+                    let mut buff = [0; 17];
+                    assert_ok!(reader.read_exact(&mut buff).await);
+                    assert_eq!(
+                        &buff,
+                        b"\x00\x00\x00\x0d\x06\x00\x00\x00\x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
+                    );
+
+                    let mut buff = [0; 5];
+                    assert_ok!(reader.read_exact(&mut buff).await);
+                    assert_eq!(&buff, b"\x00\x00\x00\x01\x01");
+
+                    let error = reader.read_u8().await.unwrap_err();
+                    assert_matches!(error.kind(), tokio::io::ErrorKind::UnexpectedEof);
+                }
+                .boxed()
+            },
+        )
+        .await;
+    }
+
     // TODO:
-    // StreamWriter
     // accepted_handshake,
     // spawn_sender,
     // spawn_client_receiver
