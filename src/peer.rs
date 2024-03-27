@@ -731,19 +731,18 @@ async fn accepted_handshake(handshake: Arc<Handshake>, stream: &mut TcpStream) -
     true
 }
 
-const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);
-
 fn spawn_sender(
     mut writer: StreamWriter,
     state: PeerState,
     mut checker: StopperCheck,
     mut messages: mpsc::Receiver<Message>,
+    queue_check_timeout: Duration,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = checker.stopped() => return,
-                result = timeout(QUEUE_CHECK_TIMEOUT, messages.recv()) => {
+                result = timeout(queue_check_timeout, messages.recv()) => {
                     let message = match result {
                         Ok(Some(message)) => message,
                         Err(_timeout) => Message::KeepAlive,
@@ -861,6 +860,7 @@ pub struct PeerClient {
 
 impl PeerClient {
     const BUFFERED_MESSAGES: usize = 40;
+    const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);
 
     pub async fn start(
         handshake: Arc<Handshake>,
@@ -887,7 +887,13 @@ impl PeerClient {
         let (reader, writer) = split_stream(stream, reader_buff_max_size);
         let (messages_sender, messages_receiver) = mpsc::channel(Self::BUFFERED_MESSAGES);
 
-        spawn_sender(writer, state.clone(), checker.clone(), messages_receiver);
+        spawn_sender(
+            writer,
+            state.clone(),
+            checker.clone(),
+            messages_receiver,
+            Self::QUEUE_CHECK_TIMEOUT,
+        );
 
         spawn_client_receiver(
             peer_addr,
@@ -955,16 +961,19 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::mpsc,
+    };
 
     use futures::future::{BoxFuture, FutureExt};
 
     use crate::InfoHash;
 
     use super::{
-        accepted_handshake, bitfield_chunks, stopper, BitfieldIndex, Handshake, Message,
-        PeerBitfield, PeerId, PeerState, StopperActor, StreamRead, StreamReader, StreamWriter,
-        Switch,
+        accepted_handshake, bitfield_chunks, spawn_sender, stopper, BitfieldIndex, Handshake,
+        Message, PeerBitfield, PeerId, PeerState, StopperActor, StopperCheck, StreamRead,
+        StreamReader, StreamWriter, Switch,
     };
 
     struct LocalListenerInner {
@@ -1106,6 +1115,48 @@ mod tests {
         assert_ok!(tpeer.await);
 
         assert_ok!(tcli.await)
+    }
+
+    async fn validate_spawn_sender<CF, PF>(
+        client_action: CF,
+        peer_action: PF,
+        sender_buffer_sz: usize,
+        queue_check_timeout: Duration,
+    ) where
+        CF: FnOnce(mpsc::Sender<Message>, PeerState) -> BoxFuture<'static, ()> + Send + 'static,
+        PF: FnOnce(tokio::net::tcp::OwnedReadHalf, StopperCheck) -> BoxFuture<'static, ()>
+            + Send
+            + 'static,
+    {
+        let listener = LocalListener::new().await;
+        let clistener = listener.clone();
+
+        let (actor, checker) = stopper();
+        let cchecker = checker.clone();
+        let state = PeerState::new(actor);
+        let cstate = state.clone();
+
+        let tpeer = tokio::spawn(async move {
+            let stream = clistener.accept().await;
+            let (reader, _) = stream.into_split();
+
+            peer_action(reader, cchecker).await;
+        });
+
+        let stream = listener.self_connect().await;
+        let (_, writer) = stream.into_split();
+        let stream_writer = StreamWriter::new(writer);
+        let (sender, receiver) = mpsc::channel(sender_buffer_sz);
+
+        spawn_sender(stream_writer, state, checker, receiver, queue_check_timeout);
+
+        let tcli = tokio::spawn(async move {
+            client_action(sender, cstate).await;
+        });
+
+        assert_ok!(tpeer.await);
+
+        assert_ok!(tcli.await);
     }
 
     #[test]
@@ -1811,6 +1862,136 @@ mod tests {
 
         assert!(!accepted);
     }
+
+    #[tokio::test]
+    async fn sender_transmits_messages_to_peer() {
+        validate_spawn_sender(
+            |sender, _| {
+                async move {
+                    let msgs = [
+                        Message::Unchoke,
+                        Message::Request {
+                            index: 43,
+                            begin: 23,
+                            length: 556,
+                        },
+                        Message::Choke,
+                        Message::NotIntersted,
+                    ];
+
+                    for msg in msgs {
+                        assert_ok!(sender.send(msg).await);
+                    }
+                }
+                .boxed()
+            },
+            |mut reader, _| {
+                async move {
+                    let raw_msgs = [
+                        b"\x00\x00\x00\x01\x01".to_vec(),
+                        b"\x00\x00\x00\x0d\x06\x00\x00\x00\x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
+                            .to_vec(),
+                        b"\x00\x00\x00\x01\x00".to_vec(),
+                        b"\x00\x00\x00\x01\x03".to_vec(),
+                    ];
+
+                    for msg in raw_msgs {
+                        let mut buffer = vec![0; msg.len()];
+
+                        assert_ok!(
+                            reader.read_exact(buffer.as_mut_slice()).await,
+                            "failed to read message: {:#04X?}",
+                            msg
+                        );
+                        assert_eq!(msg, buffer);
+                    }
+                }
+                .boxed()
+            },
+            4,
+            Duration::from_secs(3600),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sender_stops_on_explicit_close() {
+        validate_spawn_sender(
+            |_, state| {
+                async move {
+                    state.close();
+                }
+                .boxed()
+            },
+            |mut reader, mut checker| {
+                async move {
+                    checker.stopped().await;
+
+                    let error = reader.read_u8().await.unwrap_err();
+                    assert_matches!(error.kind(), tokio::io::ErrorKind::UnexpectedEof);
+                }
+                .boxed()
+            },
+            4,
+            Duration::from_secs(3600),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sender_stops_on_connection_closed() {
+        validate_spawn_sender(
+            |_, _| async move {}.boxed(),
+            |reader, mut checker| {
+                async move {
+                    std::mem::drop(reader);
+
+                    checker.stopped().await;
+                }
+                .boxed()
+            },
+            1,
+            Duration::from_secs(3600),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sender_transmits_keep_alive_on_timeout() {
+        validate_spawn_sender(
+            |sender, _| {
+                async move {
+                    let _ = sender.send(Message::Unchoke).await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                .boxed()
+            },
+            |mut reader, _| {
+                async move {
+                    let raw_msgs = [
+                        b"\x00\x00\x00\x01\x01".to_vec(),
+                        b"\x00\x00\x00\x00".to_vec(),
+                    ];
+
+                    for msg in raw_msgs {
+                        let mut buffer = vec![0; msg.len()];
+
+                        assert_ok!(
+                            reader.read_exact(buffer.as_mut_slice()).await,
+                            "failed to read message: {:#04X?}",
+                            msg
+                        );
+                        assert_eq!(msg, buffer);
+                    }
+                }
+                .boxed()
+            },
+            1,
+            Duration::from_secs(2),
+        )
+        .await;
+    }
+
     // TODO:
     // spawn_sender,
     // spawn_client_receiver
