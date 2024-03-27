@@ -954,10 +954,7 @@ impl Deref for PeerServer {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use claims::{
-        assert_err, assert_matches, assert_none, assert_ok, assert_ok_eq, assert_some,
-        assert_some_eq,
-    };
+    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use futures::future::{BoxFuture, FutureExt};
@@ -969,6 +966,147 @@ mod tests {
         PeerBitfield, PeerId, PeerState, StopperActor, StreamRead, StreamReader, StreamWriter,
         Switch,
     };
+
+    struct LocalListenerInner {
+        listener: tokio::net::TcpListener,
+        port: u16,
+    }
+
+    impl LocalListenerInner {
+        const STREAM_READER_TIMEOUT: Duration = Duration::from_secs(4);
+
+        async fn accept(&self) -> tokio::net::TcpStream {
+            let (stream, _) =
+                tokio::time::timeout(Self::STREAM_READER_TIMEOUT, self.listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+            stream
+        }
+
+        async fn self_connect(&self) -> tokio::net::TcpStream {
+            tokio::net::TcpStream::connect(format!("localhost:{}", self.port))
+                .await
+                .unwrap()
+        }
+    }
+
+    #[derive(Clone)]
+    struct LocalListener {
+        inner: Arc<LocalListenerInner>,
+    }
+
+    impl std::ops::Deref for LocalListener {
+        type Target = LocalListenerInner;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl LocalListener {
+        async fn new() -> Self {
+            let listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let inner = Arc::new(LocalListenerInner { listener, port });
+
+            Self { inner }
+        }
+    }
+
+    async fn validate_stream_reader<CF, PF>(cli_action: CF, peer_action: PF)
+    where
+        CF: FnOnce(StreamReader) -> BoxFuture<'static, ()> + Send + 'static,
+        PF: FnOnce(tokio::net::tcp::OwnedWriteHalf) -> BoxFuture<'static, ()> + Send + 'static,
+    {
+        let listener = LocalListener::new().await;
+        let clistener = listener.clone();
+
+        let tcli = tokio::spawn(async move {
+            let stream = clistener.self_connect().await;
+            let (reader, _) = stream.into_split();
+            let sreader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ);
+
+            cli_action(sreader).await;
+        });
+
+        let tpeer = tokio::spawn(async move {
+            let stream = listener.accept().await;
+            let (_, writer) = stream.into_split();
+
+            peer_action(writer).await;
+        });
+
+        assert_ok!(tcli.await);
+
+        assert_ok!(tpeer.await);
+    }
+
+    async fn validate_stream_writer<SF, PF>(server_action: SF, peer_action: PF)
+    where
+        SF: FnOnce(StreamWriter) -> BoxFuture<'static, ()> + Send + 'static,
+        PF: FnOnce(tokio::net::tcp::OwnedReadHalf) -> BoxFuture<'static, ()> + Send + 'static,
+    {
+        let listener = LocalListener::new().await;
+        let clistener = listener.clone();
+
+        let tpeer = tokio::spawn(async move {
+            let stream = clistener.accept().await;
+            let (reader, _) = stream.into_split();
+
+            peer_action(reader).await;
+        });
+
+        let tsrv = tokio::spawn(async move {
+            let stream = listener.self_connect().await;
+            let (_, writer) = stream.into_split();
+            let stream_writer = StreamWriter::new(writer);
+
+            server_action(stream_writer).await;
+        });
+
+        assert_ok!(tpeer.await);
+
+        assert_ok!(tsrv.await);
+    }
+
+    async fn validate_handshake<PF>(peer_reply: PF) -> bool
+    where
+        PF: FnOnce(
+                Arc<Handshake>,
+                tokio::net::tcp::OwnedReadHalf,
+                tokio::net::tcp::OwnedWriteHalf,
+            ) -> BoxFuture<'static, ()>
+            + Send
+            + 'static,
+    {
+        let listener = LocalListener::new().await;
+        let clistener = listener.clone();
+
+        let info_hash = InfoHash::hash(&[1, 2, 3, 4]);
+        let peer_id = PeerId::build();
+        let handshake = Arc::new(Handshake::new(info_hash, peer_id));
+        let chandshake = Arc::clone(&handshake);
+
+        let tcli = tokio::spawn(async move {
+            let mut stream = clistener.accept().await;
+
+            accepted_handshake(chandshake, &mut stream).await
+        });
+
+        let tpeer = tokio::spawn(async move {
+            let stream = listener.self_connect().await;
+            let (reader, writer) = stream.into_split();
+
+            peer_reply(handshake, reader, writer).await;
+        });
+
+        assert_ok!(tpeer.await);
+
+        assert_ok!(tcli.await)
+    }
 
     #[test]
     fn encode_handshake() {
@@ -1468,41 +1606,6 @@ mod tests {
         assert!(state.closed());
     }
 
-    const STREAM_READER_TIMEOUT: Duration = Duration::from_secs(4);
-
-    async fn validate_stream_reader<CF, PF>(cli_action: CF, peer_action: PF)
-    where
-        CF: FnOnce(StreamReader) -> BoxFuture<'static, ()> + Send + 'static,
-        PF: FnOnce(tokio::net::tcp::OwnedWriteHalf) -> BoxFuture<'static, ()> + Send + 'static,
-    {
-        let client_listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
-        let port = client_listener.local_addr().unwrap().port();
-
-        let tcli = tokio::spawn(async move {
-            let (stream, _) = tokio::time::timeout(STREAM_READER_TIMEOUT, client_listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
-            let (reader, _) = stream.into_split();
-            let sreader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ);
-
-            cli_action(sreader).await;
-        });
-
-        let tpeer = tokio::spawn(async move {
-            let peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
-                .await
-                .unwrap();
-            let (_, writer) = peer_stream.into_split();
-
-            peer_action(writer).await;
-        });
-
-        assert_ok!(tcli.await);
-
-        assert_ok!(tpeer.await);
-    }
-
     #[tokio::test]
     async fn stream_reader_reads_message() {
         validate_stream_reader(
@@ -1613,39 +1716,6 @@ mod tests {
         .await;
     }
 
-    async fn validate_stream_writer<SF, PF>(server_action: SF, peer_action: PF)
-    where
-        SF: FnOnce(StreamWriter) -> BoxFuture<'static, ()> + Send + 'static,
-        PF: FnOnce(tokio::net::tcp::OwnedReadHalf) -> BoxFuture<'static, ()> + Send + 'static,
-    {
-        let client_listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
-        let port = client_listener.local_addr().unwrap().port();
-
-        let tpeer = tokio::spawn(async move {
-            let (stream, _) = tokio::time::timeout(STREAM_READER_TIMEOUT, client_listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
-            let (reader, _) = stream.into_split();
-
-            peer_action(reader).await;
-        });
-
-        let tsrv = tokio::spawn(async move {
-            let peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
-                .await
-                .unwrap();
-            let (_, writer) = peer_stream.into_split();
-            let stream_writer = StreamWriter::new(writer);
-
-            server_action(stream_writer).await;
-        });
-
-        assert_ok!(tpeer.await);
-
-        assert_ok!(tsrv.await);
-    }
-
     #[tokio::test]
     async fn stream_writer_sends_message() {
         validate_stream_writer(
@@ -1686,48 +1756,6 @@ mod tests {
             },
         )
         .await;
-    }
-
-    async fn validate_handshake<PF>(peer_reply: PF) -> bool
-    where
-        PF: FnOnce(
-                Arc<Handshake>,
-                tokio::net::tcp::OwnedReadHalf,
-                tokio::net::tcp::OwnedWriteHalf,
-            ) -> BoxFuture<'static, ()>
-            + Send
-            + 'static,
-    {
-        let client_listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
-        let port = client_listener.local_addr().unwrap().port();
-
-        let info_hash = InfoHash::hash(&[1, 2, 3, 4]);
-        let peer_id = PeerId::build();
-        let handshake = Arc::new(Handshake::new(info_hash, peer_id));
-
-        let chandshake = Arc::clone(&handshake);
-        let tcli = tokio::spawn(async move {
-            let (mut stream, _) =
-                tokio::time::timeout(STREAM_READER_TIMEOUT, client_listener.accept())
-                    .await
-                    .unwrap()
-                    .unwrap();
-
-            accepted_handshake(chandshake, &mut stream).await
-        });
-
-        let tpeer = tokio::spawn(async move {
-            let peer_stream = tokio::net::TcpStream::connect(format!("localhost:{}", port))
-                .await
-                .unwrap();
-            let (reader, writer) = peer_stream.into_split();
-
-            peer_reply(handshake, reader, writer).await;
-        });
-
-        assert_ok!(tpeer.await);
-
-        assert_ok!(tcli.await)
     }
 
     #[tokio::test]
@@ -1783,7 +1811,6 @@ mod tests {
 
         assert!(!accepted);
     }
-
     // TODO:
     // spawn_sender,
     // spawn_client_receiver
