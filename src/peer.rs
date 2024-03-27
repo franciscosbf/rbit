@@ -982,11 +982,11 @@ mod tests {
     }
 
     impl LocalListenerInner {
-        const STREAM_READER_TIMEOUT: Duration = Duration::from_secs(4);
+        const WAIT_FOR_CONNECTION_LIMIT: Duration = Duration::from_secs(4);
 
         async fn accept(&self) -> tokio::net::TcpStream {
             let (stream, _) =
-                tokio::time::timeout(Self::STREAM_READER_TIMEOUT, self.listener.accept())
+                tokio::time::timeout(Self::WAIT_FOR_CONNECTION_LIMIT, self.listener.accept())
                     .await
                     .unwrap()
                     .unwrap();
@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     impl LocalListener {
-        async fn new() -> Self {
+        async fn build() -> Self {
             let listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
 
@@ -1030,7 +1030,7 @@ mod tests {
         CF: FnOnce(StreamReader) -> BoxFuture<'static, ()> + Send + 'static,
         PF: FnOnce(tokio::net::tcp::OwnedWriteHalf) -> BoxFuture<'static, ()> + Send + 'static,
     {
-        let listener = LocalListener::new().await;
+        let listener = LocalListener::build().await;
         let clistener = listener.clone();
 
         let tcli = tokio::spawn(async move {
@@ -1058,7 +1058,7 @@ mod tests {
         SF: FnOnce(StreamWriter) -> BoxFuture<'static, ()> + Send + 'static,
         PF: FnOnce(tokio::net::tcp::OwnedReadHalf) -> BoxFuture<'static, ()> + Send + 'static,
     {
-        let listener = LocalListener::new().await;
+        let listener = LocalListener::build().await;
         let clistener = listener.clone();
 
         let tpeer = tokio::spawn(async move {
@@ -1091,7 +1091,7 @@ mod tests {
             + Send
             + 'static,
     {
-        let listener = LocalListener::new().await;
+        let listener = LocalListener::build().await;
         let clistener = listener.clone();
 
         let info_hash = InfoHash::hash(&[1, 2, 3, 4]);
@@ -1128,7 +1128,7 @@ mod tests {
             + Send
             + 'static,
     {
-        let listener = LocalListener::new().await;
+        let listener = LocalListener::build().await;
         let clistener = listener.clone();
 
         let (actor, checker) = stopper();
