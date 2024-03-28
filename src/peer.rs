@@ -1993,7 +1993,6 @@ mod tests {
     }
 
     // TODO:
-    // spawn_sender,
     // spawn_client_receiver
     // PeerClient
 }
