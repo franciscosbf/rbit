@@ -586,10 +586,11 @@ impl Deref for PeerState {
 }
 
 #[async_trait]
+#[allow(unused_variables)]
 pub trait Events: Send + Sync {
-    async fn requested_piece(&self, piece_block: PieceBlockRequest);
-    async fn canceled_piece(&self, piece_block: CanceledPieceBlock);
-    async fn received_piece_block(&self, piece_block: ReceivedPieceBlock);
+    async fn requested_piece(&self, piece_block: PieceBlockRequest) {}
+    async fn canceled_piece(&self, piece_block: CanceledPieceBlock) {}
+    async fn received_piece_block(&self, piece_block: ReceivedPieceBlock) {}
 }
 
 #[derive(Debug)]
