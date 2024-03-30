@@ -415,7 +415,7 @@ pub enum PieceBlockSender {
     Server,
 }
 
-pub struct ClientReceivedPiece {
+pub struct ReceivedPieceBlock {
     pub index: u32,
     pub begin: u32,
     pub piece: FileBlock,
@@ -586,18 +586,11 @@ impl Deref for PeerState {
 }
 
 #[async_trait]
-pub trait BaseEvents: Send + Sync {
+pub trait Events: Send + Sync {
     async fn requested_piece(&self, piece_block: PieceBlockRequest);
     async fn canceled_piece(&self, piece_block: CanceledPieceBlock);
+    async fn received_piece_block(&self, piece_block: ReceivedPieceBlock);
 }
-
-#[async_trait]
-pub trait ClientEvents: BaseEvents {
-    async fn received_piece_block(&self, piece_block: ClientReceivedPiece);
-}
-
-#[async_trait]
-pub trait ServerEvents: BaseEvents {}
 
 #[derive(Debug)]
 enum StreamRead {
@@ -720,7 +713,7 @@ fn spawn_client_receiver(
     state: PeerState,
     bitfield: PeerBitfield,
     mut checker: StopperCheck,
-    events: Arc<dyn ClientEvents>,
+    events: Arc<dyn Events>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -777,7 +770,7 @@ fn spawn_client_receiver(
                 } => {
                     let piece = block.into();
 
-                    let piece_block = ClientReceivedPiece {
+                    let piece_block = ReceivedPieceBlock {
                         index,
                         begin,
                         piece,
@@ -827,7 +820,7 @@ impl PeerClient {
         handshake: Arc<Handshake>,
         mut stream: TcpStream,
         torrent: Arc<Torrent>,
-        senders: Arc<dyn ClientEvents>,
+        senders: Arc<dyn Events>,
     ) -> Option<Self> {
         if !accepted_handshake(handshake, &mut stream).await {
             return None;
@@ -903,7 +896,7 @@ impl PeerServer {
         handshake: Arc<Handshake>,
         listener: TcpListener,
         torrent: Arc<Torrent>,
-        senders: Box<dyn ServerEvents>,
+        senders: Box<dyn Events>,
     ) -> Result<Self, std::io::Error> {
         todo!()
     }
@@ -933,8 +926,8 @@ mod tests {
 
     use super::{
         accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_sender, stopper,
-        BitfieldIndex, CanceledPieceBlock, ClientEvents, ClientReceivedPiece, Handshake, Message,
-        PeerBitfield, PeerId, PeerState, PieceBlockRequest, StopperActor, StopperCheck, StreamRead,
+        BitfieldIndex, CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerId,
+        PeerState, PieceBlockRequest, ReceivedPieceBlock, StopperActor, StopperCheck, StreamRead,
         StreamReader, StreamWriter, Switch,
     };
 
@@ -1128,7 +1121,7 @@ mod tests {
     async fn validate_spawn_client_receiver<CF, PF>(
         client_action: CF,
         peer_action: PF,
-        events: Arc<dyn ClientEvents>,
+        events: Arc<dyn Events>,
         total_pieces: u32,
     ) where
         CF: FnOnce(PeerState, StopperCheck, PeerBitfield) -> BoxFuture<'static, ()>
