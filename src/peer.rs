@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::{
     ops::Deref,
     sync::{
@@ -584,66 +585,19 @@ impl Deref for PeerState {
     }
 }
 
-#[derive(Clone)]
-pub struct BaseSenders {
-    pub requested_pieces: mpsc::Sender<PieceBlockRequest>,
-    pub canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
+#[async_trait]
+pub trait BaseEvents: Send + Sync {
+    async fn requested_piece(&self, piece_block: PieceBlockRequest);
+    async fn canceled_piece(&self, piece_block: CanceledPieceBlock);
 }
 
-#[derive(Clone)]
-pub struct ClientSenders {
-    base: BaseSenders,
-    pub received_piece_blocks: mpsc::Sender<ClientReceivedPiece>,
+#[async_trait]
+pub trait ClientEvents: BaseEvents {
+    async fn received_piece_block(&self, piece_block: ClientReceivedPiece);
 }
 
-impl ClientSenders {
-    pub fn new(
-        request_pieces: mpsc::Sender<PieceBlockRequest>,
-        canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
-        received_piece_blocks: mpsc::Sender<ClientReceivedPiece>,
-    ) -> Self {
-        let base = BaseSenders {
-            requested_pieces: request_pieces,
-            canceled_pieces,
-        };
-
-        Self {
-            base,
-            received_piece_blocks,
-        }
-    }
-}
-
-impl Deref for ClientSenders {
-    type Target = BaseSenders;
-
-    fn deref(&self) -> &Self::Target {
-        &self.base
-    }
-}
-
-#[derive(Clone)]
-pub struct ServerSenders(BaseSenders);
-
-impl ServerSenders {
-    pub fn new(
-        request_pieces: mpsc::Sender<PieceBlockRequest>,
-        canceled_pieces: mpsc::Sender<CanceledPieceBlock>,
-    ) -> Self {
-        Self(BaseSenders {
-            requested_pieces: request_pieces,
-            canceled_pieces,
-        })
-    }
-}
-
-impl Deref for ServerSenders {
-    type Target = BaseSenders;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
+#[async_trait]
+pub trait ServerEvents: BaseEvents {}
 
 #[derive(Debug)]
 enum StreamRead {
@@ -766,14 +720,12 @@ fn spawn_client_receiver(
     state: PeerState,
     bitfield: PeerBitfield,
     mut checker: StopperCheck,
-    senders: ClientSenders,
+    events: Arc<dyn ClientEvents>,
 ) {
     tokio::spawn(async move {
         loop {
             let read = tokio::select! {
-                _ = checker.stopped() => {
-                    return;
-                },
+                _ = checker.stopped() => return,
                 read = reader.next_message() => read,
             };
 
@@ -794,7 +746,7 @@ fn spawn_client_receiver(
                 Message::NotIntersted => state.peer_uninsterest(),
                 Message::Have { piece } => bitfield.set(piece),
                 Message::Bitfield { pieces } => {
-                    if bitfield.append_overwrite(&pieces) {
+                    if !bitfield.append_overwrite(&pieces) {
                         state.close();
                         return;
                     }
@@ -804,7 +756,7 @@ fn spawn_client_receiver(
                     begin,
                     length,
                 } => {
-                    let request = PieceBlock {
+                    let piece_block = PieceBlock {
                         index,
                         begin,
                         length,
@@ -813,7 +765,10 @@ fn spawn_client_receiver(
                     }
                     .into();
 
-                    let _ = senders.requested_pieces.send(request).await;
+                    let cevents = events.clone();
+                    tokio::spawn(async move {
+                        cevents.requested_piece(piece_block).await;
+                    });
                 }
                 Message::Piece {
                     index,
@@ -829,14 +784,17 @@ fn spawn_client_receiver(
                         peer_addr,
                     };
 
-                    let _ = senders.received_piece_blocks.send(piece_block).await;
+                    let cevents = events.clone();
+                    tokio::spawn(async move {
+                        cevents.received_piece_block(piece_block).await;
+                    });
                 }
                 Message::Cancel {
                     index,
                     begin,
                     length,
                 } => {
-                    let cancel = PieceBlock {
+                    let piece_block = PieceBlock {
                         index,
                         begin,
                         length,
@@ -845,7 +803,10 @@ fn spawn_client_receiver(
                     }
                     .into();
 
-                    let _ = senders.canceled_pieces.send(cancel).await;
+                    let cevents = events.clone();
+                    tokio::spawn(async move {
+                        cevents.canceled_piece(piece_block).await;
+                    });
                 }
             }
         }
@@ -866,7 +827,7 @@ impl PeerClient {
         handshake: Arc<Handshake>,
         mut stream: TcpStream,
         torrent: Arc<Torrent>,
-        senders: ClientSenders,
+        senders: Arc<dyn ClientEvents>,
     ) -> Option<Self> {
         if !accepted_handshake(handshake, &mut stream).await {
             return None;
@@ -942,7 +903,7 @@ impl PeerServer {
         handshake: Arc<Handshake>,
         listener: TcpListener,
         torrent: Arc<Torrent>,
-        senders: ServerSenders,
+        senders: Box<dyn ServerEvents>,
     ) -> Result<Self, std::io::Error> {
         todo!()
     }
@@ -958,7 +919,7 @@ impl Deref for PeerServer {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
@@ -968,11 +929,12 @@ mod tests {
 
     use futures::future::{BoxFuture, FutureExt};
 
-    use crate::InfoHash;
+    use crate::{InfoHash, PeerAddr};
 
     use super::{
-        accepted_handshake, bitfield_chunks, spawn_sender, stopper, BitfieldIndex, Handshake,
-        Message, PeerBitfield, PeerId, PeerState, StopperActor, StopperCheck, StreamRead,
+        accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_sender, stopper,
+        BitfieldIndex, CanceledPieceBlock, ClientEvents, ClientReceivedPiece, Handshake, Message,
+        PeerBitfield, PeerId, PeerState, PieceBlockRequest, StopperActor, StopperCheck, StreamRead,
         StreamReader, StreamWriter, Switch,
     };
 
@@ -998,6 +960,10 @@ mod tests {
             tokio::net::TcpStream::connect(format!("localhost:{}", self.port))
                 .await
                 .unwrap()
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.listener.local_addr().unwrap()
         }
     }
 
@@ -1152,6 +1118,51 @@ mod tests {
 
         let tcli = tokio::spawn(async move {
             client_action(sender, cstate).await;
+        });
+
+        assert_ok!(tpeer.await);
+
+        assert_ok!(tcli.await);
+    }
+
+    async fn validate_spawn_client_receiver<CF, PF>(
+        client_action: CF,
+        peer_action: PF,
+        events: Arc<dyn ClientEvents>,
+        total_pieces: u32,
+    ) where
+        CF: FnOnce(PeerState, StopperCheck, PeerBitfield) -> BoxFuture<'static, ()>
+            + Send
+            + 'static,
+        PF: FnOnce(tokio::net::tcp::OwnedWriteHalf) -> BoxFuture<'static, ()> + Send + 'static,
+    {
+        let listener = LocalListener::build().await;
+        let clistener = listener.clone();
+
+        let (actor, checker) = stopper();
+        let cchecker = checker.clone();
+        let state = PeerState::new(actor);
+        let cstate = state.clone();
+
+        let tpeer = tokio::spawn(async move {
+            let stream = clistener.accept().await;
+            let (_, writer) = stream.into_split();
+
+            peer_action(writer).await;
+        });
+
+        let peer_addr = listener.addr().into();
+        let bitfield = PeerBitfield::new(total_pieces);
+        let cbitfield = bitfield.clone();
+
+        let stream = listener.self_connect().await;
+        let (reader, _) = stream.into_split();
+        let stream_reader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ + total_pieces);
+
+        spawn_client_receiver(peer_addr, stream_reader, state, bitfield, checker, events);
+
+        let tcli = tokio::spawn(async move {
+            client_action(cstate, cchecker, cbitfield);
         });
 
         assert_ok!(tpeer.await);
