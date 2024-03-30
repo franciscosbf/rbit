@@ -494,8 +494,8 @@ impl StopperActor {
 struct StopperCheck(watch::Receiver<bool>);
 
 impl StopperCheck {
-    async fn stopped(&mut self) -> bool {
-        self.0.changed().await.map(|_| true).unwrap_or(true)
+    async fn stopped(&mut self) {
+        let _ = self.0.changed().await;
     }
 }
 
@@ -715,7 +715,7 @@ fn spawn_client_receiver(
     bitfield: PeerBitfield,
     mut checker: StopperCheck,
     events: Arc<dyn Events>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let read = tokio::select! {
@@ -804,7 +804,7 @@ fn spawn_client_receiver(
                 }
             }
         }
-    });
+    })
 }
 
 pub struct PeerClient {
@@ -923,7 +923,7 @@ mod tests {
 
     use futures::future::{BoxFuture, FutureExt};
 
-    use crate::{InfoHash, PeerAddr};
+    use crate::InfoHash;
 
     use super::{
         accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_sender, stopper,
@@ -1119,24 +1119,24 @@ mod tests {
         assert_ok!(tcli.await);
     }
 
-    async fn validate_spawn_client_receiver<CF, PF>(
-        client_action: CF,
+    async fn validate_spawn_client_receiver_with_8_pieces_and_20_cli_recv_buff_sz<CF, PF>(
+        client_checker: CF,
         peer_action: PF,
         events: Arc<dyn Events>,
-        total_pieces: u32,
     ) where
-        CF: FnOnce(PeerState, StopperCheck, PeerBitfield) -> BoxFuture<'static, ()>
-            + Send
-            + 'static,
+        CF: FnOnce(PeerState, PeerBitfield),
         PF: FnOnce(tokio::net::tcp::OwnedWriteHalf) -> BoxFuture<'static, ()> + Send + 'static,
     {
         let listener = LocalListener::build().await;
         let clistener = listener.clone();
 
         let (actor, checker) = stopper();
-        let cchecker = checker.clone();
         let state = PeerState::new(actor);
         let cstate = state.clone();
+
+        let peer_addr = listener.addr().into();
+        let bitfield = PeerBitfield::new(8);
+        let cbitfield = bitfield.clone();
 
         let tpeer = tokio::spawn(async move {
             let stream = clistener.accept().await;
@@ -1145,23 +1145,18 @@ mod tests {
             peer_action(writer).await;
         });
 
-        let peer_addr = listener.addr().into();
-        let bitfield = PeerBitfield::new(total_pieces);
-        let cbitfield = bitfield.clone();
-
         let stream = listener.self_connect().await;
         let (reader, _) = stream.into_split();
-        let stream_reader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ + total_pieces);
+        let stream_reader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ);
 
-        spawn_client_receiver(peer_addr, stream_reader, state, bitfield, checker, events);
-
-        let tcli = tokio::spawn(async move {
-            client_action(cstate, cchecker, cbitfield);
-        });
+        let trcv =
+            spawn_client_receiver(peer_addr, stream_reader, cstate, bitfield, checker, events);
 
         assert_ok!(tpeer.await);
 
-        assert_ok!(tcli.await);
+        assert_ok!(trcv.await);
+
+        client_checker(state, cbitfield);
     }
 
     #[test]
@@ -1993,6 +1988,150 @@ mod tests {
             },
             1,
             Duration::from_secs(2),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_unchoke_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
+        validate_spawn_client_receiver_with_8_pieces_and_20_cli_recv_buff_sz(
+            |state, _| {
+                assert!(!state.am_choking_peer());
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x01").await);
+                }
+                .boxed()
+            },
+            events,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_choke_msg_after_unchoke_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
+        validate_spawn_client_receiver_with_8_pieces_and_20_cli_recv_buff_sz(
+            |state, _| {
+                assert!(state.am_choking_peer());
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x01").await);
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x00").await);
+                }
+                .boxed()
+            },
+            events,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_interested_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
+        validate_spawn_client_receiver_with_8_pieces_and_20_cli_recv_buff_sz(
+            |state, _| {
+                assert!(state.peer_interested());
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x02").await);
+                }
+                .boxed()
+            },
+            events,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_not_interested_msg_after_interested_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
+        validate_spawn_client_receiver_with_8_pieces_and_20_cli_recv_buff_sz(
+            |state, _| {
+                assert!(!state.peer_interested());
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x02").await);
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x03").await);
+                }
+                .boxed()
+            },
+            events,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_have_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
+        validate_spawn_client_receiver_with_8_pieces_and_20_cli_recv_buff_sz(
+            |_, bitfield| {
+                assert_some_eq!(bitfield.has(3), true);
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(
+                        writer
+                            .write_all(b"\x00\x00\x00\x05\x04\x00\x00\x00\x03")
+                            .await
+                    );
+                }
+                .boxed()
+            },
+            events,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_bitfield_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
+        validate_spawn_client_receiver_with_8_pieces_and_20_cli_recv_buff_sz(
+            |_, bitfield| {
+                assert_eq!(bitfield.raw(), &[0b10010010]);
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x02\x05\x92").await);
+                }
+                .boxed()
+            },
+            events,
         )
         .await;
     }
