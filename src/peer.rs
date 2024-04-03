@@ -920,7 +920,7 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
-    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
+    use claims::{assert_err, assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
@@ -2309,7 +2309,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_with_supposed_size_bigger_than_the_buffer() {
+    async fn client_receiver_gets_unchoke_keep_alive_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+            |state, _, _| {
+                async move {
+                    assert!(!state.am_choking_peer());
+                }
+                .boxed()
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x00").await);
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x01").await);
+                }
+                .boxed()
+            },
+            EventsMock,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_msg_with_size_bigger_than_the_buffer() {
         struct EventsMock;
 
         impl Events for EventsMock {}
@@ -2346,6 +2371,7 @@ mod tests {
             |mut writer| {
                 async move {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x05").await);
+                    assert_err!(writer.write_all(b"\x00\x00\x00\x00").await);
                 }
                 .boxed()
             },
@@ -2371,25 +2397,6 @@ mod tests {
                 async move {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x01").await);
-                }
-                .boxed()
-            },
-            EventsMock,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn client_receiver_gets_keep_alive_msg() {
-        struct EventsMock;
-
-        impl Events for EventsMock {}
-
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, _, _| async move {}.boxed(),
-            |mut writer| {
-                async move {
-                    assert_ok!(writer.write_all(b"\x00\x00\x00\x00").await);
                 }
                 .boxed()
             },
