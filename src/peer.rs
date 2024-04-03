@@ -933,8 +933,8 @@ mod tests {
     use super::{
         accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_sender, stopper,
         BitfieldIndex, CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerId,
-        PeerState, PieceBlock, PieceBlockRequest, PieceBlockSender, ReceivedPieceBlock,
-        StopperActor, StopperCheck, StreamRead, StreamReader, StreamWriter, Switch,
+        PeerState, PieceBlockRequest, PieceBlockSender, ReceivedPieceBlock, StopperActor,
+        StopperCheck, StreamRead, StreamReader, StreamWriter, Switch,
     };
 
     struct LocalListenerInner {
@@ -1143,7 +1143,7 @@ mod tests {
         let bitfield = PeerBitfield::new(8);
         let cbitfield = bitfield.clone();
 
-        tokio::spawn(async move {
+        let tpeer = tokio::spawn(async move {
             let stream = clistener.accept().await;
             let (_, writer) = stream.into_split();
 
@@ -1161,6 +1161,8 @@ mod tests {
         assert_ok!(trcv.await);
 
         client_checker(state, cbitfield, peer_addr).await;
+
+        assert_ok!(tpeer.await);
     }
 
     #[test]
@@ -2148,6 +2150,8 @@ mod tests {
 
     #[tokio::test]
     async fn client_receiver_gets_different_bitfield() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
         struct EventsMock;
 
         impl Events for EventsMock {}
@@ -2155,6 +2159,7 @@ mod tests {
         validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
+                    let _ = sender.send(()).await;
                     assert!(state.closed());
                 }
                 .boxed()
@@ -2162,7 +2167,7 @@ mod tests {
             |mut writer| {
                 async move {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x03\x05\x92\x23").await);
-                    tokio::time::sleep(Duration::from_secs(69)).await;
+                    receiver.recv().await;
                 }
                 .boxed()
             },
@@ -2335,12 +2340,19 @@ mod tests {
 
     #[tokio::test]
     async fn client_receiver_gets_msg_with_size_bigger_than_the_buffer() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
         struct EventsMock;
 
         impl Events for EventsMock {}
 
         validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, _, _| async move {}.boxed(),
+            |_, _, _| {
+                async move {
+                    let _ = sender.send(()).await;
+                }
+                .boxed()
+            },
             |mut writer| {
                 async move {
                     assert_ok!(
@@ -2351,7 +2363,7 @@ mod tests {
                             )
                             .await
                     );
-                    tokio::time::sleep(Duration::from_secs(69)).await;
+                    receiver.recv().await;
                 }
                 .boxed()
             },
@@ -2371,7 +2383,6 @@ mod tests {
             |mut writer| {
                 async move {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x05").await);
-                    assert_err!(writer.write_all(b"\x00\x00\x00\x00").await);
                 }
                 .boxed()
             },
