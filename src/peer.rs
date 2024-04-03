@@ -920,7 +920,7 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
-    use claims::{assert_err, assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
+    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
