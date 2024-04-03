@@ -1124,7 +1124,7 @@ mod tests {
         assert_ok!(tcli.await);
     }
 
-    async fn validate_spawn_client_receiver_with_8_pieces<CF, PF>(
+    async fn validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size<CF, PF>(
         client_checker: CF,
         peer_action: PF,
         events: impl Events + 'static,
@@ -1152,7 +1152,7 @@ mod tests {
 
         let stream = listener.self_connect().await;
         let (reader, _) = stream.into_split();
-        let stream_reader = StreamReader::new(reader, u32::MAX);
+        let stream_reader = StreamReader::new(reader, 69);
         let events = Arc::new(events);
 
         let trcv =
@@ -2002,7 +2002,7 @@ mod tests {
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(!state.am_choking_peer());
@@ -2026,7 +2026,7 @@ mod tests {
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(state.am_choking_peer());
@@ -2051,7 +2051,7 @@ mod tests {
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(state.peer_interested());
@@ -2075,7 +2075,7 @@ mod tests {
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(!state.peer_interested());
@@ -2100,7 +2100,7 @@ mod tests {
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |_, bitfield, _| {
                 async move {
                     assert_some_eq!(bitfield.has(3), true);
@@ -2128,7 +2128,7 @@ mod tests {
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |_, bitfield, _| {
                 async move {
                     assert_eq!(bitfield.raw(), &[0b10010010]);
@@ -2152,7 +2152,7 @@ mod tests {
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(state.closed());
@@ -2186,7 +2186,7 @@ mod tests {
             }
         }
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _, peer_addr| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
@@ -2232,7 +2232,7 @@ mod tests {
             }
         }
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _, peer_addr| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
@@ -2277,7 +2277,7 @@ mod tests {
             }
         }
 
-        validate_spawn_client_receiver_with_8_pieces(
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _, peer_addr| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
@@ -2304,6 +2304,96 @@ mod tests {
                 .boxed()
             },
             EventsMock { sender },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_with_supposed_size_bigger_than_the_buffer() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+            |_, _, _| async move {}.boxed(),
+            |mut writer| {
+                async move {
+                    assert_ok!(
+                        writer
+                            .write_all(
+                                b"\x00\x00\x00\x64\x08\x00\x00\x00\
+                                \x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
+                            )
+                            .await
+                    );
+                    tokio::time::sleep(Duration::from_secs(69)).await;
+                }
+                .boxed()
+            },
+            EventsMock,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_does_not_get_the_entire_message() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+            |_, _, _| async move {}.boxed(),
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x05").await);
+                }
+                .boxed()
+            },
+            EventsMock,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_unchoke_msg_after_invalid_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+            |state, _, _| {
+                async move {
+                    assert!(!state.am_choking_peer());
+                }
+                .boxed()
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x01").await);
+                }
+                .boxed()
+            },
+            EventsMock,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_keep_alive_msg() {
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+            |_, _, _| async move {}.boxed(),
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x00").await);
+                }
+                .boxed()
+            },
+            EventsMock,
         )
         .await;
     }
