@@ -1,5 +1,6 @@
 use core::ops::Deref;
 
+#[derive(Debug)]
 pub struct FileBlock(pub Vec<u8>);
 
 impl Deref for FileBlock {
