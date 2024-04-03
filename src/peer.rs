@@ -2309,6 +2309,5 @@ mod tests {
     }
 
     // TODO:
-    // spawn_client_receiver
     // PeerClient
 }
