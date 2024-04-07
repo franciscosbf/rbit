@@ -450,6 +450,7 @@ impl From<PieceBlock> for PieceBlockRequest {
     }
 }
 
+#[derive(Debug)]
 pub struct CanceledPieceBlock(PieceBlock);
 
 impl Deref for CanceledPieceBlock {
@@ -569,7 +570,7 @@ impl PeerStateInner {
 }
 
 #[derive(Clone)]
-struct PeerState {
+pub struct PeerState {
     inner: Arc<PeerStateInner>,
 }
 
@@ -695,6 +696,7 @@ fn spawn_sender(
             tokio::select! {
                 _ = checker.stopped() => return,
                 result = timeout(queue_check_timeout, messages.recv()) => {
+                    println!("{result:?}");
                     let message = match result {
                         Ok(Some(message)) => message,
                         Err(_timeout) => Message::KeepAlive,
@@ -726,6 +728,7 @@ fn spawn_client_receiver(
                 _ = checker.stopped() => return,
                 read = reader.next_message() => read,
             };
+            println!("{read:?}");
 
             let message = match read {
                 StreamRead::Received(message) => message,
@@ -819,7 +822,7 @@ pub struct PeerClient {
 
 impl PeerClient {
     const BUFFERED_MESSAGES: usize = 40;
-    const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);
+    const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(4000);
 
     pub async fn start(
         handshake: Arc<Handshake>,
@@ -882,7 +885,7 @@ impl PeerClient {
 }
 
 impl Deref for PeerClient {
-    type Target = PeerStateInner;
+    type Target = PeerState;
 
     fn deref(&self) -> &Self::Target {
         &self.state
@@ -932,8 +935,8 @@ mod tests {
 
     use super::{
         accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_sender, stopper,
-        BitfieldIndex, CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerId,
-        PeerState, PieceBlockRequest, PieceBlockSender, ReceivedPieceBlock, StopperActor,
+        BitfieldIndex, CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient,
+        PeerId, PeerState, PieceBlockRequest, PieceBlockSender, ReceivedPieceBlock, StopperActor,
         StopperCheck, StreamRead, StreamReader, StreamWriter, Switch,
     };
 
@@ -2414,6 +2417,84 @@ mod tests {
             EventsMock,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn mf_truth() {
+        use crate::{
+            torrent::{parse, Torrent},
+            tracker::{Event, TrackerClient},
+        };
+        use std::{env, fs};
+
+        use async_trait::async_trait;
+
+        let tfile = fs::read(env::var("FILE").unwrap()).unwrap();
+        let torrent: Arc<Torrent> = parse(tfile.as_slice()).unwrap().into();
+        let peer_id = PeerId::build();
+        let base_url = torrent.tracker.clone();
+        let info_hash = torrent.info_hash;
+        let timeout = Duration::from_millis(2500);
+        let tcli = TrackerClient::new(base_url, &info_hash, &peer_id, timeout);
+        let peers = tcli
+            .fetch_peers(6881, 0, 0, 0, Event::Started)
+            .await
+            .unwrap();
+
+        struct EventsMock;
+
+        #[async_trait]
+        impl Events for EventsMock {
+            async fn requested_piece(&self, piece_block: PieceBlockRequest) {
+                println!("{piece_block:?}");
+            }
+            async fn received_piece_block(&self, piece_block: ReceivedPieceBlock) {
+                println!("{piece_block:?}");
+            }
+            async fn canceled_piece(&self, piece_block: CanceledPieceBlock) {
+                println!("{piece_block:?}");
+            }
+        }
+
+        let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
+        let handshake = Handshake::new(info_hash, peer_id).into();
+        let mut stream = None;
+        for peer in peers.addresses {
+            if let Ok(Ok(s)) = tokio::time::timeout(
+                Duration::from_millis(1500),
+                tokio::net::TcpStream::connect(peer.0),
+            )
+            .await
+            {
+                stream.replace(s);
+                break;
+            }
+            println!("{:?} is dead", peer.0);
+        }
+        println!(
+            "{:?} is alive",
+            stream.as_ref().unwrap().peer_addr().unwrap()
+        );
+
+        let senders = Arc::new(EventsMock);
+        let pcli = PeerClient::start(handshake, stream.unwrap(), torrent, senders)
+            .await
+            .unwrap();
+
+        pcli.send_message(Message::Bitfield {
+            pieces: bitfield.raw(),
+        })
+        .await;
+
+        pcli.send_message(Message::Interested).await;
+        pcli.send_message(Message::Request {
+            index: 0,
+            begin: 0,
+            length: 16384,
+        })
+        .await;
+
+        tokio::time::sleep(Duration::from_secs(20)).await;
     }
 
     // TODO:
