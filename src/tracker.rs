@@ -173,7 +173,7 @@ impl From<u64> for Interval {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct PeerAddr(SocketAddr);
+pub struct PeerAddr(pub SocketAddr);
 
 impl From<SocketAddr> for PeerAddr {
     fn from(value: SocketAddr) -> Self {
