@@ -696,7 +696,7 @@ fn spawn_sender(
             tokio::select! {
                 _ = checker.stopped() => return,
                 result = timeout(queue_check_timeout, messages.recv()) => {
-                    println!("{result:?}");
+
                     let message = match result {
                         Ok(Some(message)) => message,
                         Err(_timeout) => Message::KeepAlive,
@@ -728,7 +728,6 @@ fn spawn_client_receiver(
                 _ = checker.stopped() => return,
                 read = reader.next_message() => read,
             };
-            println!("{read:?}");
 
             let message = match read {
                 StreamRead::Received(message) => message,
