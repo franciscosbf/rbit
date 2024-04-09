@@ -929,8 +929,9 @@ mod tests {
     };
 
     use futures::future::{BoxFuture, FutureExt};
+    use url::Url;
 
-    use crate::{InfoHash, PeerAddr};
+    use crate::{FileType, InfoHash, PeerAddr, Torrent};
 
     use super::{
         accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_sender, stopper,
@@ -1165,6 +1166,56 @@ mod tests {
         client_checker(state, cbitfield, peer_addr).await;
 
         assert_ok!(tpeer.await);
+    }
+
+    async fn validate_client<CF, PF>(
+        client_controller: CF,
+        peer_receiver: PF,
+        events: impl Events + 'static,
+    ) where
+        CF: FnOnce(PeerClient) -> BoxFuture<'static, ()> + Send + 'static,
+        PF: FnOnce(
+                tokio::net::tcp::OwnedReadHalf,
+                tokio::net::tcp::OwnedWriteHalf,
+            ) -> BoxFuture<'static, ()>
+            + Send
+            + 'static,
+    {
+        let listener = LocalListener::build().await;
+        let clistener = listener.clone();
+
+        let tpeer = tokio::spawn(async move {
+            let stream = clistener.accept().await;
+            let (reader, writer) = stream.into_split();
+
+            peer_receiver(reader, writer).await;
+        });
+
+        let torrent: Arc<_> = Torrent {
+            tracker: Url::parse("http://localhost:80").unwrap(),
+            piece_size: u64::pow(2, 16),
+            hash_pieces: vec![1].try_into().unwrap(),
+            length: 0,
+            file_type: FileType::Single {
+                name: "".to_string(),
+            },
+            info_hash: InfoHash([1; 20]),
+        }
+        .into();
+        let peer_id = PeerId::build();
+        let handshake = Handshake::new(torrent.info_hash, peer_id).into();
+        let senders = Arc::new(events);
+        let stream = listener.self_connect().await;
+
+        let pcli = assert_some!(PeerClient::start(handshake, stream, torrent, senders).await);
+
+        let tcli = tokio::spawn(async move {
+            client_controller(pcli).await;
+        });
+
+        assert_ok!(tpeer.await);
+
+        assert_ok!(tcli.await);
     }
 
     #[test]
@@ -2419,81 +2470,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mf_truth() {
-        use crate::{
-            torrent::{parse, Torrent},
-            tracker::{Event, TrackerClient},
-        };
-        use std::{env, fs};
+    async fn send_messages_trough_client() {
+        todo!()
+    }
 
-        use async_trait::async_trait;
-
-        let tfile = fs::read(env::var("FILE").unwrap()).unwrap();
-        let torrent: Arc<Torrent> = parse(tfile.as_slice()).unwrap().into();
-        let peer_id = PeerId::build();
-        let base_url = torrent.tracker.clone();
-        let info_hash = torrent.info_hash;
-        let timeout = Duration::from_millis(2500);
-        let tcli = TrackerClient::new(base_url, &info_hash, &peer_id, timeout);
-        let peers = tcli
-            .fetch_peers(6881, 0, 0, 0, Event::Started)
-            .await
-            .unwrap();
-
-        struct EventsMock;
-
-        #[async_trait]
-        impl Events for EventsMock {
-            async fn requested_piece(&self, piece_block: PieceBlockRequest) {
-                println!("{piece_block:?}");
-            }
-            async fn received_piece_block(&self, piece_block: ReceivedPieceBlock) {
-                println!("{piece_block:?}");
-            }
-            async fn canceled_piece(&self, piece_block: CanceledPieceBlock) {
-                println!("{piece_block:?}");
-            }
-        }
-
-        let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
-        let handshake = Handshake::new(info_hash, peer_id).into();
-        let mut stream = None;
-        for peer in peers.addresses {
-            if let Ok(Ok(s)) = tokio::time::timeout(
-                Duration::from_millis(1500),
-                tokio::net::TcpStream::connect(peer.0),
-            )
-            .await
-            {
-                stream.replace(s);
-                break;
-            }
-            println!("{:?} is dead", peer.0);
-        }
-        println!(
-            "{:?} is alive",
-            stream.as_ref().unwrap().peer_addr().unwrap()
-        );
-
-        let senders = Arc::new(EventsMock);
-        let pcli = PeerClient::start(handshake, stream.unwrap(), torrent, senders)
-            .await
-            .unwrap();
-
-        pcli.send_message(Message::Bitfield {
-            pieces: bitfield.raw(),
-        })
-        .await;
-
-        pcli.send_message(Message::Interested).await;
-        pcli.send_message(Message::Request {
-            index: 0,
-            begin: 0,
-            length: 16384,
-        })
-        .await;
-
-        tokio::time::sleep(Duration::from_secs(20)).await;
+    #[tokio::test]
+    async fn client_receives_invalid_handshake() {
+        todo!()
     }
 
     // TODO:
