@@ -295,7 +295,7 @@ pub enum Message {
 impl Message {
     const MAX_STATIC_MSG_SZ: u32 = 13;
 
-    pub const MAX_PIECE_CHUNK_SZ: u32 = 32768;
+    pub const MAX_PIECE_CHUNK_SZ: u32 = u32::pow(2, 14);
 
     fn encode(self, buff: &mut Vec<u8>) {
         match self {
