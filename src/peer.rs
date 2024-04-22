@@ -2470,7 +2470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_messages_trough_client() {
+    async fn send_messages_through_client() {
         todo!()
     }
 
