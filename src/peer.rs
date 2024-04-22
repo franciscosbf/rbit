@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::{file::FileBlock, InfoHash, PeerAddr, Torrent};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerId(pub [u8; 20]);
 
 impl PeerId {
@@ -56,7 +56,7 @@ fn u32_to_bytes(value: u32) -> [u8; 4] {
     value.to_be_bytes()
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Handshake {
     protocol: String,
     info_hash: InfoHash,
@@ -293,8 +293,6 @@ pub enum Message {
 }
 
 impl Message {
-    const MAX_STATIC_MSG_SZ: u32 = 13;
-
     pub const MAX_PIECE_CHUNK_SZ: u32 = u32::pow(2, 14);
 
     fn encode(self, buff: &mut Vec<u8>) {
@@ -678,6 +676,7 @@ async fn accepted_handshake(handshake: Arc<Handshake>, stream: &mut TcpStream) -
     let mut handshake_reply = vec![0; raw.len()];
 
     if stream.read_exact(&mut handshake_reply).await.is_err() {
+        println!(">>>>>>hi");
         return false;
     }
 
@@ -813,6 +812,12 @@ fn spawn_client_receiver(
     })
 }
 
+fn calc_reader_buff_max_size(piece_size: u32, bitfield_chunks: u32) -> u32 {
+    Message::MAX_PIECE_CHUNK_SZ
+        .max(piece_size)
+        .max(bitfield_chunks)
+}
+
 pub struct PeerClient {
     state: PeerState,
     bitfield: PeerBitfield,
@@ -837,10 +842,8 @@ impl PeerClient {
 
         let peer_addr = stream.peer_addr().unwrap().into();
 
-        let reader_buff_max_size = ((Message::MAX_PIECE_CHUNK_SZ as u64).min(torrent.piece_size)
-            as u32)
-            .max(bitfield.num_chunks())
-            .max(Message::MAX_STATIC_MSG_SZ);
+        let reader_buff_max_size =
+            calc_reader_buff_max_size(torrent.piece_size as u32, bitfield.num_chunks());
 
         let (actor, checker) = stopper();
         let state = PeerState::new(actor);
@@ -1168,13 +1171,11 @@ mod tests {
         assert_ok!(tpeer.await);
     }
 
-    async fn validate_client<CF, PF>(
-        client_controller: CF,
-        peer_receiver: PF,
-        events: impl Events + 'static,
-    ) where
+    async fn validate_client<CF, PF>(client_controller: CF, peer_receiver: PF) -> bool
+    where
         CF: FnOnce(PeerClient) -> BoxFuture<'static, ()> + Send + 'static,
         PF: FnOnce(
+                Arc<Handshake>,
                 tokio::net::tcp::OwnedReadHalf,
                 tokio::net::tcp::OwnedWriteHalf,
             ) -> BoxFuture<'static, ()>
@@ -1184,17 +1185,10 @@ mod tests {
         let listener = LocalListener::build().await;
         let clistener = listener.clone();
 
-        let tpeer = tokio::spawn(async move {
-            let stream = clistener.accept().await;
-            let (reader, writer) = stream.into_split();
-
-            peer_receiver(reader, writer).await;
-        });
-
         let torrent: Arc<_> = Torrent {
             tracker: Url::parse("http://localhost:80").unwrap(),
-            piece_size: u64::pow(2, 16),
-            hash_pieces: vec![1].try_into().unwrap(),
+            piece_size: Message::MAX_PIECE_CHUNK_SZ as u64,
+            hash_pieces: vec![0; 20].try_into().unwrap(),
             length: 0,
             file_type: FileType::Single {
                 name: "".to_string(),
@@ -1203,11 +1197,27 @@ mod tests {
         }
         .into();
         let peer_id = PeerId::build();
-        let handshake = Handshake::new(torrent.info_hash, peer_id).into();
-        let senders = Arc::new(events);
+        let handshake = Arc::new(Handshake::new(torrent.info_hash, peer_id));
+        let chandshake = handshake.clone();
+
+        let tpeer = tokio::spawn(async move {
+            let stream = clistener.accept().await;
+            let (reader, writer) = stream.into_split();
+
+            peer_receiver(chandshake, reader, writer).await;
+        });
+
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        let senders = Arc::new(EventsMock);
         let stream = listener.self_connect().await;
 
-        let pcli = assert_some!(PeerClient::start(handshake, stream, torrent, senders).await);
+        let pcli = match PeerClient::start(handshake, stream, torrent, senders).await {
+            Some(pcli) => pcli,
+            None => return false,
+        };
 
         let tcli = tokio::spawn(async move {
             client_controller(pcli).await;
@@ -1216,6 +1226,8 @@ mod tests {
         assert_ok!(tpeer.await);
 
         assert_ok!(tcli.await);
+
+        true
     }
 
     #[test]
@@ -2470,15 +2482,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_messages_through_client() {
-        todo!()
+    async fn send_through_client_choke_and_then_keep_alive_due_to_inactivity() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        assert!(
+            validate_client(
+                |peer_client| async move {
+                    peer_client.send_message(Message::Choke).await;
+
+                    receiver.recv().await;
+                }
+                .boxed(),
+                |handshake, mut reader, mut writer| async move {
+                    let mut buff = vec![0; handshake.raw().len()];
+                    assert_ok!(reader.read_exact(&mut buff).await);
+
+                    let received_handshake = assert_some!(Handshake::decode(&buff));
+                    assert_eq!(*handshake, received_handshake);
+
+                    assert_ok!(writer.write_all(&buff).await);
+
+                    let mut buff = vec![69; 5];
+                    assert_ok!(reader.read_exact(&mut buff).await);
+                    assert_eq!(buff, [0, 0, 0, 1, 0]);
+
+                    let mut buff = vec![69; 4];
+                    assert_ok!(reader.read_exact(&mut buff).await);
+                    assert_eq!(buff, [0, 0, 0, 0]);
+
+                    let _ = sender.send(()).await;
+                }
+                .boxed(),
+            )
+            .await
+        );
     }
 
     #[tokio::test]
     async fn client_receives_invalid_handshake() {
-        todo!()
-    }
+        assert!(
+            !validate_client(
+                |_| async move {}.boxed(),
+                |handshake, mut reader, mut writer| async move {
+                    let mut buff = vec![0; handshake.raw().len()];
+                    assert_ok!(reader.read_exact(&mut buff).await);
 
-    // TODO:
-    // PeerClient
+                    let received_handshake = assert_some!(Handshake::decode(&buff));
+                    assert_eq!(*handshake, received_handshake);
+
+                    assert_ok!(writer.write_all(&[69, 69, 69]).await);
+                }
+                .boxed(),
+            )
+            .await
+        );
+    }
 }

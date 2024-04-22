@@ -224,7 +224,7 @@ impl TryFrom<Vec<u8>> for HashPieces {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InfoHash(pub [u8; 20]);
 
 impl InfoHash {
