@@ -2482,7 +2482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_through_client_choke_and_then_keep_alive_due_to_inactivity() {
+    async fn send_through_client_choke_and_keep_alive_due_to_inactivity() {
         let (sender, mut receiver) = mpsc::channel(1);
 
         assert!(
