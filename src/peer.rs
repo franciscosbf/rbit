@@ -1007,7 +1007,7 @@ mod tests {
         let tcli = tokio::spawn(async move {
             let stream = clistener.self_connect().await;
             let (reader, _) = stream.into_split();
-            let sreader = StreamReader::new(reader, Message::MAX_STATIC_MSG_SZ);
+            let sreader = StreamReader::new(reader, Message::MAX_PIECE_CHUNK_SZ);
 
             cli_action(sreader).await;
         });
@@ -1778,7 +1778,7 @@ mod tests {
             },
             |mut writer| {
                 async move {
-                    assert_ok!(writer.write_u32(Message::MAX_STATIC_MSG_SZ + 1).await);
+                    assert_ok!(writer.write_u32(Message::MAX_PIECE_CHUNK_SZ + 1).await);
                 }
                 .boxed()
             },
