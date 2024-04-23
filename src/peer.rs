@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use std::{
     ops::Deref,
     sync::{
@@ -588,12 +587,17 @@ impl Deref for PeerState {
     }
 }
 
-#[async_trait]
-#[allow(unused_variables)]
-pub trait Events: Send + Sync {
-    async fn requested_piece(&self, piece_block: PieceBlockRequest) {}
-    async fn received_piece_block(&self, piece_block: ReceivedPieceBlock) {}
-    async fn canceled_piece(&self, piece_block: CanceledPieceBlock) {}
+#[trait_variant::make(Send + Sync)]
+pub trait Events {
+    async fn requested_piece(&self, _piece_block: PieceBlockRequest) {
+        async {}
+    }
+    async fn received_piece_block(&self, _piece_block: ReceivedPieceBlock) {
+        async {}
+    }
+    async fn canceled_piece(&self, _piece_block: CanceledPieceBlock) {
+        async {}
+    }
 }
 
 #[derive(Debug)]
@@ -719,7 +723,7 @@ fn spawn_client_receiver(
     state: PeerState,
     bitfield: PeerBitfield,
     mut checker: StopperCheck,
-    events: Arc<dyn Events>,
+    events: Arc<impl Events + 'static>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -832,7 +836,7 @@ impl PeerClient {
         handshake: Arc<Handshake>,
         mut stream: TcpStream,
         torrent: Arc<Torrent>,
-        senders: Arc<dyn Events>,
+        senders: Arc<impl Events + 'static>,
     ) -> Option<Self> {
         if !accepted_handshake(handshake, &mut stream).await {
             return None;
@@ -906,7 +910,7 @@ impl PeerServer {
         handshake: Arc<Handshake>,
         listener: TcpListener,
         torrent: Arc<Torrent>,
-        senders: Box<dyn Events>,
+        senders: Box<impl Events + 'static>,
     ) -> Result<Self, std::io::Error> {
         todo!()
     }
@@ -924,7 +928,6 @@ impl Deref for PeerServer {
 mod tests {
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-    use async_trait::async_trait;
     use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -2249,7 +2252,6 @@ mod tests {
             sender: mpsc::Sender<PieceBlockRequest>,
         }
 
-        #[async_trait]
         impl Events for EventsMock {
             async fn requested_piece(&self, piece_block: PieceBlockRequest) {
                 let _ = self.sender.send(piece_block).await;
@@ -2295,7 +2297,6 @@ mod tests {
             sender: mpsc::Sender<ReceivedPieceBlock>,
         }
 
-        #[async_trait]
         impl Events for EventsMock {
             async fn received_piece_block(&self, piece_block: ReceivedPieceBlock) {
                 let _ = self.sender.send(piece_block).await;
@@ -2340,7 +2341,6 @@ mod tests {
             sender: mpsc::Sender<CanceledPieceBlock>,
         }
 
-        #[async_trait]
         impl Events for EventsMock {
             async fn canceled_piece(&self, piece_block: CanceledPieceBlock) {
                 let _ = self.sender.send(piece_block).await;

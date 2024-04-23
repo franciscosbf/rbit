@@ -12,7 +12,7 @@ url = "2.5"
 reqwest = "0.12"
 sha1 = "0.10.6"
 tokio-stream = "0.1"
-async-trait = "0.1.79"
+trait-variant = "0.1"
 
 [dependencies.tokio]
 version = "1"
