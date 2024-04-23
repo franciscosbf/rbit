@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use std::{
     ops::Deref,
     sync::{
@@ -292,6 +293,8 @@ pub enum Message {
 }
 
 impl Message {
+    const MAX_STATIC_MSG_SZ: u32 = 13;
+
     pub const MAX_PIECE_CHUNK_SZ: u32 = u32::pow(2, 14);
 
     fn encode(self, buff: &mut Vec<u8>) {
@@ -611,30 +614,37 @@ enum StreamRead {
 struct StreamReader {
     reader: tcp::OwnedReadHalf,
     buff_max_size: u32,
+    buff: BytesMut,
 }
 
 impl StreamReader {
     fn new(reader: tcp::OwnedReadHalf, buff_max_size: u32) -> Self {
+        let buff = BytesMut::with_capacity(Message::MAX_STATIC_MSG_SZ as usize);
+
         Self {
             reader,
             buff_max_size,
+            buff,
         }
     }
 
     async fn next_message(&mut self) -> StreamRead {
         let msg_len = match self.reader.read_u32().await {
-            Ok(msg_len) if msg_len <= self.buff_max_size => msg_len,
+            Ok(msg_len) if msg_len <= self.buff_max_size => msg_len as usize,
             Ok(_) => return StreamRead::Error,
             Err(_) => return StreamRead::NotReceived,
         };
 
-        let mut raw = vec![0; msg_len as usize];
+        self.buff.reserve(msg_len);
+        unsafe {
+            self.buff.set_len(msg_len);
+        }
 
-        if self.reader.read_exact(&mut raw).await.is_err() {
+        if self.reader.read_exact(&mut self.buff).await.is_err() {
             return StreamRead::NotReceived;
         }
 
-        Message::decode(&raw)
+        Message::decode(&self.buff)
             .map(StreamRead::Received)
             .unwrap_or(StreamRead::Invalid)
     }
@@ -2379,7 +2389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_unchoke_keep_alive_msg() {
+    async fn client_receiver_gets_unchoke_and_keep_alive_msgs() {
         struct EventsMock;
 
         impl Events for EventsMock {}
