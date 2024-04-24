@@ -1,11 +1,14 @@
 use bytes::BytesMut;
+use futures::{future::Future, task::Poll};
 use leaky_bucket::RateLimiter;
 use std::{
     ops::Deref,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
     },
+    task::Context,
     time::Duration,
 };
 use tokio::{
@@ -710,14 +713,18 @@ impl ReceiverTolerance {
                 .build(),
         )
     }
+}
 
-    async fn keep_receiving(&self) -> bool {
+impl Future for ReceiverTolerance {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let aquisition = self.0.acquire_one();
         tokio::pin!(aquisition);
 
-        let state: futures::task::Poll<_> = futures::poll!(aquisition);
+        let tolerate = aquisition.poll(cx).is_ready();
 
-        matches!(state, futures::task::Poll::Ready(_))
+        Poll::Ready(tolerate)
     }
 }
 
@@ -733,7 +740,6 @@ fn spawn_sender(
             tokio::select! {
                 _ = checker.stopped() => return,
                 result = timeout(queue_check_timeout, messages.recv()) => {
-
                     let message = match result {
                         Ok(Some(message)) => message,
                         Err(_timeout) => Message::KeepAlive,
@@ -760,7 +766,8 @@ fn spawn_client_receiver(
     events: Arc<impl Events + 'static>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let tolerance = ReceiverTolerance::new();
+        let keep_tolerating = ReceiverTolerance::new();
+        tokio::pin!(keep_tolerating);
 
         loop {
             let read = tokio::select! {
@@ -771,7 +778,7 @@ fn spawn_client_receiver(
             let message = match read {
                 StreamRead::Received(message) => message,
                 StreamRead::Invalid => {
-                    if tolerance.keep_receiving().await {
+                    if (&mut keep_tolerating).await {
                         continue;
                     }
 
