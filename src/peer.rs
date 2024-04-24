@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, RwLock,
     },
     task::Context,
@@ -167,9 +167,42 @@ fn valid_bitfield(total_pieces: u32, raw: &[u8]) -> bool {
 }
 
 #[derive(Debug)]
+struct BitfieldChunk(AtomicU8);
+
+impl BitfieldChunk {
+    fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    fn has(&self, offset: u32) -> bool {
+        let chunk = self.0.load(Ordering::Acquire);
+
+        ((chunk >> offset) & 1) == 1
+    }
+
+    fn set(&self, offset: u32) {
+        self.0.fetch_or(1 << offset, Ordering::AcqRel);
+    }
+
+    fn get(&self) -> u8 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn append(&self, chunk: u8) {
+        self.0.fetch_or(chunk, Ordering::AcqRel);
+    }
+}
+
+impl From<u8> for BitfieldChunk {
+    fn from(value: u8) -> Self {
+        Self(AtomicU8::new(value))
+    }
+}
+
+#[derive(Debug)]
 pub struct PeerBitfieldInner {
     total_pieces: u32,
-    pieces: RwLock<Vec<u8>>,
+    pieces: Vec<BitfieldChunk>,
     num_chunks: u32,
 }
 
@@ -180,12 +213,10 @@ impl PeerBitfieldInner {
         }
 
         self.pieces
-            .write()
-            .unwrap()
-            .iter_mut()
+            .iter()
             .zip(raw)
-            .for_each(|(current_chunk, new_chunk)| {
-                *current_chunk |= new_chunk;
+            .for_each(|(current_chunk, &new_chunk)| {
+                current_chunk.append(new_chunk);
             });
 
         true
@@ -197,10 +228,9 @@ impl PeerBitfieldInner {
         }
 
         let bindex = BitfieldIndex::new(index);
-        let chunk = { self.pieces.read().unwrap()[bindex.chunk_index] };
-        let piece = (chunk >> bindex.offset) & 1;
+        let chunk = &self.pieces[bindex.chunk_index];
 
-        Some(piece == 1)
+        Some(chunk.has(bindex.offset))
     }
 
     pub fn set(&self, index: u32) {
@@ -209,11 +239,13 @@ impl PeerBitfieldInner {
         }
 
         let bindex = BitfieldIndex::new(index);
-        self.pieces.write().unwrap()[bindex.chunk_index] |= 1 << bindex.offset;
+        let chunk = &self.pieces[bindex.chunk_index];
+
+        chunk.set(bindex.offset);
     }
 
     pub fn raw(&self) -> Vec<u8> {
-        self.pieces.read().unwrap().clone()
+        self.pieces.iter().map(|chunk| chunk.get()).collect()
     }
 
     fn num_chunks(&self) -> u32 {
@@ -229,7 +261,9 @@ pub struct PeerBitfield {
 impl PeerBitfield {
     pub fn new(total_pieces: u32) -> Self {
         let num_chunks = bitfield_chunks(total_pieces);
-        let pieces = RwLock::new(vec![0; num_chunks as usize]);
+        let mut pieces = Vec::with_capacity(num_chunks as usize);
+
+        (0..num_chunks).for_each(|_| pieces.push(BitfieldChunk::new()));
 
         let inner = Arc::new(PeerBitfieldInner {
             total_pieces,
@@ -245,7 +279,7 @@ impl PeerBitfield {
             return None;
         }
 
-        let pieces = RwLock::new(raw.to_vec());
+        let pieces = raw.iter().map(|&raw| raw.into()).collect();
         let num_chunks = bitfield_chunks(total_pieces);
         let inner = Arc::new(PeerBitfieldInner {
             total_pieces,
@@ -1430,7 +1464,7 @@ mod tests {
         bitfield.set(24);
         bitfield.set(65);
 
-        assert_eq!(bitfield.pieces.read().unwrap().as_slice(), &[0, 0, 0]);
+        assert_eq!(bitfield.raw(), &[0, 0, 0]);
 
         [0, 3, 6, 8, 10, 13, 15, 16, 18, 23]
             .iter()
