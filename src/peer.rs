@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use leaky_bucket::RateLimiter;
 use std::{
     ops::Deref,
     sync::{
@@ -696,6 +697,30 @@ async fn accepted_handshake(handshake: Arc<Handshake>, stream: &mut TcpStream) -
     true
 }
 
+struct ReceiverTolerance(RateLimiter);
+
+impl ReceiverTolerance {
+    fn new() -> Self {
+        Self(
+            RateLimiter::builder()
+                .initial(3)
+                .max(3)
+                .refill(1)
+                .interval(Duration::from_secs(2))
+                .build(),
+        )
+    }
+
+    async fn keep_receiving(&self) -> bool {
+        let aquisition = self.0.acquire_one();
+        tokio::pin!(aquisition);
+
+        let state: futures::task::Poll<_> = futures::poll!(aquisition);
+
+        matches!(state, futures::task::Poll::Ready(_))
+    }
+}
+
 fn spawn_sender(
     mut writer: StreamWriter,
     state: PeerState,
@@ -735,6 +760,8 @@ fn spawn_client_receiver(
     events: Arc<impl Events + 'static>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let tolerance = ReceiverTolerance::new();
+
         loop {
             let read = tokio::select! {
                 _ = checker.stopped() => return,
@@ -743,11 +770,14 @@ fn spawn_client_receiver(
 
             let message = match read {
                 StreamRead::Received(message) => message,
-                StreamRead::Invalid => continue,
-                StreamRead::Error | StreamRead::NotReceived => {
-                    state.close();
-                    return;
+                StreamRead::Invalid => {
+                    if tolerance.keep_receiving().await {
+                        continue;
+                    }
+
+                    break;
                 }
+                StreamRead::Error | StreamRead::NotReceived => break,
             };
 
             match message {
@@ -759,8 +789,7 @@ fn spawn_client_receiver(
                 Message::Have { piece } => bitfield.set(piece),
                 Message::Bitfield { pieces } => {
                     if !bitfield.append_overwrite(&pieces) {
-                        state.close();
-                        return;
+                        break;
                     }
                 }
                 Message::Request {
@@ -822,6 +851,8 @@ fn spawn_client_receiver(
                 }
             }
         }
+
+        state.close();
     })
 }
 
@@ -937,7 +968,7 @@ impl Deref for PeerServer {
 mod tests {
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
+    use claims::{assert_err, assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
@@ -2482,6 +2513,41 @@ mod tests {
                 async move {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x01\x01").await);
+                }
+                .boxed()
+            },
+            EventsMock,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_receiver_gets_4_invalid_messages_and_closes_connection_after_4th_message() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        struct EventsMock;
+
+        impl Events for EventsMock {}
+
+        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+            |state, _, _| {
+                async move {
+                    while !state.closed() {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+
+                    let _ = sender.send(()).await;
+                }
+                .boxed()
+            },
+            |mut writer| {
+                async move {
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
+                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
+
+                    receiver.recv().await;
                 }
                 .boxed()
             },
