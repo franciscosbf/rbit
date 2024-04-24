@@ -188,7 +188,7 @@ impl BitfieldChunk {
         self.0.load(Ordering::Acquire)
     }
 
-    fn append(&self, chunk: u8) {
+    fn append_overwrite(&self, chunk: u8) {
         self.0.fetch_or(chunk, Ordering::AcqRel);
     }
 }
@@ -215,7 +215,7 @@ impl PeerBitfieldInner {
             .iter()
             .zip(raw)
             .for_each(|(current_chunk, &new_chunk)| {
-                current_chunk.append(new_chunk);
+                current_chunk.append_overwrite(new_chunk);
             });
 
         true
