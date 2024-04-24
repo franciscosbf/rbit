@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc, RwLock,
+        Arc,
     },
     task::Context,
     time::Duration,
@@ -203,7 +203,6 @@ impl From<u8> for BitfieldChunk {
 pub struct PeerBitfieldInner {
     total_pieces: u32,
     pieces: Vec<BitfieldChunk>,
-    num_chunks: u32,
 }
 
 impl PeerBitfieldInner {
@@ -249,7 +248,7 @@ impl PeerBitfieldInner {
     }
 
     fn num_chunks(&self) -> u32 {
-        self.num_chunks
+        self.pieces.len() as u32
     }
 }
 
@@ -268,7 +267,6 @@ impl PeerBitfield {
         let inner = Arc::new(PeerBitfieldInner {
             total_pieces,
             pieces,
-            num_chunks,
         });
 
         Self { inner }
@@ -280,11 +278,9 @@ impl PeerBitfield {
         }
 
         let pieces = raw.iter().map(|&raw| raw.into()).collect();
-        let num_chunks = bitfield_chunks(total_pieces);
         let inner = Arc::new(PeerBitfieldInner {
             total_pieces,
             pieces,
-            num_chunks,
         });
         let bitfield = PeerBitfield { inner };
 
