@@ -975,32 +975,6 @@ impl Deref for PeerClient {
     }
 }
 
-pub struct PeerServer {
-    state: Arc<PeerStateInner>,
-    // TODO: hashmap of (PeerAddr, client
-    // (communication channels to know where
-    // to send requested/canceled pieces????))
-}
-
-impl PeerServer {
-    pub fn start(
-        handshake: Arc<Handshake>,
-        listener: TcpListener,
-        torrent: Arc<Torrent>,
-        senders: Box<impl Events + 'static>,
-    ) -> Result<Self, std::io::Error> {
-        todo!()
-    }
-}
-
-impl Deref for PeerServer {
-    type Target = PeerStateInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, sync::Arc, time::Duration};
