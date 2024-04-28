@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{tcp, TcpListener, TcpStream},
+    net::{tcp, TcpStream},
     sync::{mpsc, watch},
     time::timeout,
 };
@@ -86,46 +86,6 @@ impl Handshake {
             peer_id,
             encoded,
         }
-    }
-
-    fn decode(raw: &[u8]) -> Option<Self> {
-        if raw.is_empty() {
-            return None;
-        }
-
-        let pstrlen = raw[0] as usize;
-
-        if raw.len() != pstrlen + 49 {
-            return None;
-        }
-
-        let mut encoded = vec![0];
-
-        encoded[0] = pstrlen as u8;
-
-        let raw = &raw[1..];
-        let protocol = unsafe { std::str::from_utf8_unchecked(&raw[..pstrlen]) }.into();
-
-        encoded.extend_from_slice(&raw[..pstrlen]);
-        encoded.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-
-        let raw = &raw[pstrlen + 8..];
-        let info_hash = InfoHash(raw[..20].try_into().unwrap());
-
-        encoded.extend_from_slice(&raw[..20]);
-
-        let peer_id = (&raw[20..]).into();
-
-        encoded.extend_from_slice(&raw[20..]);
-
-        let handshake = Self {
-            protocol,
-            info_hash,
-            peer_id,
-            encoded,
-        };
-
-        Some(handshake)
     }
 
     fn raw(&self) -> &[u8] {
@@ -758,7 +718,7 @@ impl Future for ReceiverTolerance {
     }
 }
 
-fn spawn_client_sender(
+fn spawn_sender(
     mut writer: StreamWriter,
     state: PeerState,
     mut checker: StopperCheck,
@@ -787,7 +747,7 @@ fn spawn_client_sender(
     });
 }
 
-fn spawn_client_receiver(
+fn spawn_receiver(
     peer_addr: PeerAddr,
     mut reader: StreamReader,
     state: PeerState,
@@ -932,7 +892,7 @@ impl PeerClient {
         let (reader, writer) = split_stream(stream, reader_buff_max_size);
         let (messages_sender, messages_receiver) = mpsc::channel(Self::BUFFERED_MESSAGES);
 
-        spawn_client_sender(
+        spawn_sender(
             writer,
             state.clone(),
             checker.clone(),
@@ -940,7 +900,7 @@ impl PeerClient {
             Self::QUEUE_CHECK_TIMEOUT,
         );
 
-        spawn_client_receiver(
+        spawn_receiver(
             peer_addr,
             reader,
             state.clone(),
@@ -991,9 +951,9 @@ mod tests {
     use crate::{FileType, InfoHash, PeerAddr, Torrent};
 
     use super::{
-        accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_client_sender, stopper,
-        BitfieldIndex, CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient,
-        PeerId, PeerState, PieceBlockRequest, PieceBlockSender, ReceivedPieceBlock, StopperActor,
+        accepted_handshake, bitfield_chunks, spawn_receiver, spawn_sender, stopper, BitfieldIndex,
+        CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient, PeerId,
+        PeerState, PieceBlockRequest, PieceBlockSender, ReceivedPieceBlock, StopperActor,
         StopperCheck, StreamRead, StreamReader, StreamWriter, Switch,
     };
 
@@ -1142,7 +1102,7 @@ mod tests {
         assert_ok!(tcli.await)
     }
 
-    async fn validate_spawn_client_sender<CF, PF>(
+    async fn validate_spawn_sender<CF, PF>(
         client_action: CF,
         peer_action: PF,
         sender_buffer_sz: usize,
@@ -1173,7 +1133,7 @@ mod tests {
         let stream_writer = StreamWriter::new(writer);
         let (sender, receiver) = mpsc::channel(sender_buffer_sz);
 
-        spawn_client_sender(stream_writer, state, checker, receiver, queue_check_timeout);
+        spawn_sender(stream_writer, state, checker, receiver, queue_check_timeout);
 
         let tcli = tokio::spawn(async move {
             client_action(sender, cstate).await;
@@ -1184,7 +1144,7 @@ mod tests {
         assert_ok!(tcli.await);
     }
 
-    async fn validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size<CF, PF>(
+    async fn validate_spawn_receiver_with_8_pieces_and_69_of_buff_size<CF, PF>(
         client_checker: CF,
         peer_action: PF,
         events: impl Events + 'static,
@@ -1215,8 +1175,7 @@ mod tests {
         let stream_reader = StreamReader::new(reader, 69);
         let events = Arc::new(events);
 
-        let trcv =
-            spawn_client_receiver(peer_addr, stream_reader, cstate, bitfield, checker, events);
+        let trcv = spawn_receiver(peer_addr, stream_reader, cstate, bitfield, checker, events);
 
         assert_ok!(trcv.await);
 
@@ -1298,35 +1257,6 @@ mod tests {
             AAAAAAAAAAAAAAAAAAAA\
             -RB0100-TPhjEUZd5yX2"
         );
-    }
-
-    #[test]
-    fn decode_valid_handshake() {
-        let raw = b"\x13BitTorrent protocol\
-            \x00\x00\x00\x00\x00\x00\x00\x00\
-            AAAAAAAAAAAAAAAAAAAA\
-            -RB0100-TPhjEUZd5yX2";
-
-        let handshake = assert_some!(Handshake::decode(raw));
-        assert_eq!(handshake.protocol, "BitTorrent protocol");
-        assert_eq!(&handshake.info_hash.0, b"AAAAAAAAAAAAAAAAAAAA");
-        assert_eq!(&handshake.peer_id.0, b"-RB0100-TPhjEUZd5yX2");
-        assert_eq!(handshake.raw(), raw);
-    }
-
-    #[test]
-    fn decode_empty_handshake() {
-        let raw = b"";
-
-        assert_none!(Handshake::decode(raw));
-    }
-
-    #[test]
-    fn decode_invalid_handshake_size() {
-        let raw = b"\x13BitTorrent protocol\
-            -RB0100-TPhjEUZd5yX2";
-
-        assert_none!(Handshake::decode(raw));
     }
 
     #[test]
@@ -1989,8 +1919,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_sender_transmits_messages_to_peer() {
-        validate_spawn_client_sender(
+    async fn sender_transmits_messages_to_peer() {
+        validate_spawn_sender(
             |sender, _| {
                 async move {
                     let msgs = [
@@ -2040,8 +1970,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_sender_stops_on_explicit_close() {
-        validate_spawn_client_sender(
+    async fn sender_stops_on_explicit_close() {
+        validate_spawn_sender(
             |_, state| {
                 async move {
                     state.close();
@@ -2064,8 +1994,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_sender_stops_on_connection_closed() {
-        validate_spawn_client_sender(
+    async fn sender_stops_on_connection_closed() {
+        validate_spawn_sender(
             |_, _| async move {}.boxed(),
             |reader, mut checker| {
                 async move {
@@ -2082,8 +2012,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_sender_transmits_keep_alive_on_timeout() {
-        validate_spawn_client_sender(
+    async fn sender_transmits_keep_alive_on_timeout() {
+        validate_spawn_sender(
             |sender, _| {
                 async move {
                     let _ = sender.send(Message::Unchoke).await;
@@ -2118,12 +2048,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_unchoke_msg() {
+    async fn receiver_gets_unchoke_msg() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(!state.am_choking_peer());
@@ -2142,12 +2072,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_choke_msg_after_unchoke_msg() {
+    async fn receiver_gets_choke_msg_after_unchoke_msg() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(state.am_choking_peer());
@@ -2167,12 +2097,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_interested_msg() {
+    async fn receiver_gets_interested_msg() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(state.peer_interested());
@@ -2191,12 +2121,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_not_interested_msg_after_interested_msg() {
+    async fn receiver_gets_not_interested_msg_after_interested_msg() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(!state.peer_interested());
@@ -2216,12 +2146,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_have_msg() {
+    async fn receiver_gets_have_msg() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, bitfield, _| {
                 async move {
                     assert_some_eq!(bitfield.has(3), true);
@@ -2244,12 +2174,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_bitfield_msg() {
+    async fn receiver_gets_bitfield_msg() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, bitfield, _| {
                 async move {
                     assert_eq!(bitfield.raw(), &[0b10010010]);
@@ -2268,14 +2198,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_different_bitfield() {
+    async fn receiver_gets_different_bitfield() {
         let (sender, mut receiver) = mpsc::channel(1);
 
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     let _ = sender.send(()).await;
@@ -2296,7 +2226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_request_msg() {
+    async fn receiver_gets_request_msg() {
         let (sender, mut receiver) = mpsc::channel(1);
 
         struct EventsMock {
@@ -2309,7 +2239,7 @@ mod tests {
             }
         }
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _, peer_addr| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
@@ -2341,7 +2271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_piece_msg() {
+    async fn receiver_gets_piece_msg() {
         let (sender, mut receiver) = mpsc::channel(1);
 
         struct EventsMock {
@@ -2354,7 +2284,7 @@ mod tests {
             }
         }
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _, peer_addr| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
@@ -2385,7 +2315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_cancel_msg() {
+    async fn receiver_gets_cancel_msg() {
         let (sender, mut receiver) = mpsc::channel(1);
 
         struct EventsMock {
@@ -2398,7 +2328,7 @@ mod tests {
             }
         }
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _, peer_addr| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
@@ -2430,12 +2360,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_unchoke_and_keep_alive_msgs() {
+    async fn receiver_gets_unchoke_and_keep_alive_msgs() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(!state.am_choking_peer());
@@ -2455,14 +2385,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_msg_with_size_bigger_than_the_buffer() {
+    async fn receiver_gets_msg_with_size_bigger_than_the_buffer() {
         let (sender, mut receiver) = mpsc::channel(1);
 
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _, _| {
                 async move {
                     let _ = sender.send(()).await;
@@ -2489,12 +2419,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_does_not_get_the_entire_message() {
+    async fn receiver_does_not_get_the_entire_message() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _, _| async move {}.boxed(),
             |mut writer| {
                 async move {
@@ -2508,12 +2438,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_unchoke_msg_after_invalid_msg() {
+    async fn receiver_gets_unchoke_msg_after_invalid_msg() {
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     assert!(!state.am_choking_peer());
@@ -2533,14 +2463,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_receiver_gets_4_invalid_messages_and_closes_connection_after_4th_message() {
+    async fn receiver_gets_4_invalid_messages_and_closes_connection_after_4th_message() {
         let (sender, mut receiver) = mpsc::channel(1);
 
         struct EventsMock;
 
         impl Events for EventsMock {}
 
-        validate_spawn_client_receiver_with_8_pieces_and_69_of_buff_size(
+        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _, _| {
                 async move {
                     while !state.closed() {
@@ -2583,8 +2513,7 @@ mod tests {
                     let mut buff = vec![0; handshake.raw().len()];
                     assert_ok!(reader.read_exact(&mut buff).await);
 
-                    let received_handshake = assert_some!(Handshake::decode(&buff));
-                    assert_eq!(*handshake, received_handshake);
+                    assert_eq!(handshake.raw(), buff);
 
                     assert_ok!(writer.write_all(&buff).await);
 
@@ -2613,8 +2542,7 @@ mod tests {
                     let mut buff = vec![0; handshake.raw().len()];
                     assert_ok!(reader.read_exact(&mut buff).await);
 
-                    let received_handshake = assert_some!(Handshake::decode(&buff));
-                    assert_eq!(*handshake, received_handshake);
+                    assert_eq!(handshake.raw(), buff);
 
                     assert_ok!(writer.write_all(&[69, 69, 69]).await);
                 }
