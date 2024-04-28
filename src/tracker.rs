@@ -278,6 +278,8 @@ pub struct TrackerClient {
 }
 
 impl TrackerClient {
+    const FAKE_PORT: u16 = 6881;
+
     pub fn new(
         mut base_url: Url,
         info_hash: &InfoHash,
@@ -300,7 +302,6 @@ impl TrackerClient {
 
     pub async fn fetch_peers(
         &self,
-        listening_port: u16,
         uploaded: usize,
         downloaded: usize,
         left: usize,
@@ -309,7 +310,7 @@ impl TrackerClient {
         let body = self
             .http_client
             .get(self.base_url.as_str())
-            .query(&[("port", listening_port.to_string())])
+            .query(&[("port", Self::FAKE_PORT.to_string())])
             .query(&[("uploaded", uploaded)])
             .query(&[("downloaded", downloaded)])
             .query(&[("left", left)])
@@ -591,7 +592,7 @@ mod tests {
         Mock::given(any())
             .and(query_param_contains("info_hash", ""))
             .and(query_param_contains("peer_id", "-RB0100-"))
-            .and(query_param("port", "6881"))
+            .and(query_param("port", TrackerClient::FAKE_PORT.to_string()))
             .and(query_param("uploaded", "0"))
             .and(query_param("downloaded", "0"))
             .and(query_param("left", "658505728"))
@@ -608,7 +609,7 @@ mod tests {
             .await;
 
         let result = TrackerClient::new(base_url, &info_hash, &peer_id, timeout)
-            .fetch_peers(6881, 0, 0, 658505728, super::Event::Started)
+            .fetch_peers(0, 0, 658505728, super::Event::Started)
             .await;
 
         let response = assert_ok!(result);
