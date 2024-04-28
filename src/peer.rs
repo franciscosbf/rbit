@@ -758,7 +758,7 @@ impl Future for ReceiverTolerance {
     }
 }
 
-fn spawn_sender(
+fn spawn_client_sender(
     mut writer: StreamWriter,
     state: PeerState,
     mut checker: StopperCheck,
@@ -932,7 +932,7 @@ impl PeerClient {
         let (reader, writer) = split_stream(stream, reader_buff_max_size);
         let (messages_sender, messages_receiver) = mpsc::channel(Self::BUFFERED_MESSAGES);
 
-        spawn_sender(
+        spawn_client_sender(
             writer,
             state.clone(),
             checker.clone(),
@@ -1017,7 +1017,7 @@ mod tests {
     use crate::{FileType, InfoHash, PeerAddr, Torrent};
 
     use super::{
-        accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_sender, stopper,
+        accepted_handshake, bitfield_chunks, spawn_client_receiver, spawn_client_sender, stopper,
         BitfieldIndex, CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient,
         PeerId, PeerState, PieceBlockRequest, PieceBlockSender, ReceivedPieceBlock, StopperActor,
         StopperCheck, StreamRead, StreamReader, StreamWriter, Switch,
@@ -1168,7 +1168,7 @@ mod tests {
         assert_ok!(tcli.await)
     }
 
-    async fn validate_spawn_sender<CF, PF>(
+    async fn validate_spawn_client_sender<CF, PF>(
         client_action: CF,
         peer_action: PF,
         sender_buffer_sz: usize,
@@ -1199,7 +1199,7 @@ mod tests {
         let stream_writer = StreamWriter::new(writer);
         let (sender, receiver) = mpsc::channel(sender_buffer_sz);
 
-        spawn_sender(stream_writer, state, checker, receiver, queue_check_timeout);
+        spawn_client_sender(stream_writer, state, checker, receiver, queue_check_timeout);
 
         let tcli = tokio::spawn(async move {
             client_action(sender, cstate).await;
@@ -2015,8 +2015,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sender_transmits_messages_to_peer() {
-        validate_spawn_sender(
+    async fn client_sender_transmits_messages_to_peer() {
+        validate_spawn_client_sender(
             |sender, _| {
                 async move {
                     let msgs = [
@@ -2066,8 +2066,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sender_stops_on_explicit_close() {
-        validate_spawn_sender(
+    async fn client_sender_stops_on_explicit_close() {
+        validate_spawn_client_sender(
             |_, state| {
                 async move {
                     state.close();
@@ -2090,8 +2090,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sender_stops_on_connection_closed() {
-        validate_spawn_sender(
+    async fn client_sender_stops_on_connection_closed() {
+        validate_spawn_client_sender(
             |_, _| async move {}.boxed(),
             |reader, mut checker| {
                 async move {
@@ -2108,8 +2108,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sender_transmits_keep_alive_on_timeout() {
-        validate_spawn_sender(
+    async fn client_sender_transmits_keep_alive_on_timeout() {
+        validate_spawn_client_sender(
             |sender, _| {
                 async move {
                     let _ = sender.send(Message::Unchoke).await;
