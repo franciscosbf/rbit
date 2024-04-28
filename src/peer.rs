@@ -683,11 +683,7 @@ async fn accepted_handshake(handshake: Arc<Handshake>, stream: &mut TcpStream) -
 
     let mut handshake_reply = vec![0; raw.len()];
 
-    if stream.read_exact(&mut handshake_reply).await.is_err() {
-        return false;
-    }
-
-    true
+    stream.read_exact(&mut handshake_reply).await.is_ok()
 }
 
 struct ReceiverTolerance(RateLimiter);
