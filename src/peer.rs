@@ -404,12 +404,6 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum PieceBlockSender {
-    Client,
-    Server,
-}
-
 #[derive(Debug)]
 pub struct ReceivedPieceBlock {
     pub index: u32,
@@ -424,42 +418,10 @@ pub struct PieceBlock {
     pub begin: u32,
     pub length: u32,
     pub peer_addr: PeerAddr,
-    pub sender: PieceBlockSender,
 }
 
-#[derive(Debug)]
-pub struct PieceBlockRequest(PieceBlock);
-
-impl Deref for PieceBlockRequest {
-    type Target = PieceBlock;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<PieceBlock> for PieceBlockRequest {
-    fn from(value: PieceBlock) -> Self {
-        PieceBlockRequest(value)
-    }
-}
-
-#[derive(Debug)]
-pub struct CanceledPieceBlock(PieceBlock);
-
-impl Deref for CanceledPieceBlock {
-    type Target = PieceBlock;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<PieceBlock> for CanceledPieceBlock {
-    fn from(value: PieceBlock) -> Self {
-        CanceledPieceBlock(value)
-    }
-}
+pub type PieceBlockRequest = PieceBlock;
+pub type CanceledPieceBlock = PieceBlock;
 
 struct Switch(AtomicBool);
 
@@ -795,9 +757,7 @@ fn spawn_receiver(
                         begin,
                         length,
                         peer_addr,
-                        sender: PieceBlockSender::Client,
-                    }
-                    .into();
+                    };
 
                     let cevents = events.clone();
                     tokio::spawn(async move {
@@ -833,9 +793,7 @@ fn spawn_receiver(
                         begin,
                         length,
                         peer_addr,
-                        sender: PieceBlockSender::Client,
-                    }
-                    .into();
+                    };
 
                     let cevents = events.clone();
                     tokio::spawn(async move {
@@ -949,8 +907,8 @@ mod tests {
     use super::{
         accepted_handshake, bitfield_chunks, spawn_receiver, spawn_sender, stopper, BitfieldIndex,
         CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient, PeerId,
-        PeerState, PieceBlockRequest, PieceBlockSender, ReceivedPieceBlock, StopperActor,
-        StopperCheck, StreamRead, StreamReader, StreamWriter, Switch,
+        PeerState, PieceBlockRequest, ReceivedPieceBlock, StopperActor, StopperCheck, StreamRead,
+        StreamReader, StreamWriter, Switch,
     };
 
     struct LocalListenerInner {
@@ -2243,7 +2201,6 @@ mod tests {
                     assert_eq!(msg.index, 43);
                     assert_eq!(msg.begin, 23);
                     assert_eq!(msg.length, 556);
-                    assert_matches!(msg.sender, PieceBlockSender::Client);
                     assert_eq!(msg.peer_addr, peer_addr);
                 }
                 .boxed()
@@ -2332,7 +2289,6 @@ mod tests {
                     assert_eq!(msg.index, 43);
                     assert_eq!(msg.begin, 23);
                     assert_eq!(msg.length, 556);
-                    assert_matches!(msg.sender, PieceBlockSender::Client);
                     assert_eq!(msg.peer_addr, peer_addr);
                 }
                 .boxed()
