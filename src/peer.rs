@@ -1,12 +1,13 @@
 use bytes::BytesMut;
 use futures::{future::Future, task::Poll};
 use leaky_bucket::RateLimiter;
+use running_average::RealTimeRunningAverage;
 use std::{
     ops::Deref,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::Context,
     time::Duration,
@@ -469,9 +470,33 @@ fn stopper() -> (StopperActor, StopperCheck) {
     (actor, check)
 }
 
+struct ThroughputRate {
+    average: Mutex<RealTimeRunningAverage<u32>>,
+}
+
+impl ThroughputRate {
+    fn new() -> Self {
+        Self {
+            average: Mutex::new(RealTimeRunningAverage::default()),
+        }
+    }
+
+    fn update(&self, chunk_size: u32) {
+        self.average.lock().unwrap().insert(chunk_size);
+    }
+
+    fn current(&self) -> f64 {
+        let measurement = { self.average.lock().unwrap().measurement() };
+
+        measurement.to_rate()
+    }
+}
+
 pub struct PeerStateInner {
     am_choking: Switch,
     peer_interested: Switch,
+    upload_rate: ThroughputRate,
+    download_rate: ThroughputRate,
     closed: Switch,
     actor: StopperActor,
 }
@@ -481,6 +506,8 @@ impl PeerStateInner {
         Self {
             am_choking: Switch::new(true),
             peer_interested: Switch::new(false),
+            upload_rate: ThroughputRate::new(),
+            download_rate: ThroughputRate::new(),
             closed: Switch::new(false),
             actor,
         }
@@ -502,6 +529,14 @@ impl PeerStateInner {
         self.peer_interested.unset();
     }
 
+    fn update_download_rate(&self, bytes: u32) {
+        self.download_rate.update(bytes);
+    }
+
+    fn update_upload_rate(&self, bytes: u32) {
+        self.upload_rate.update(bytes);
+    }
+
     fn close(&self) {
         if self.closed() {
             return;
@@ -518,6 +553,14 @@ impl PeerStateInner {
 
     pub fn peer_interested(&self) -> bool {
         self.peer_interested.current()
+    }
+
+    pub fn download_rate(&self) -> f64 {
+        self.download_rate.current()
+    }
+
+    pub fn upload_rate(&self) -> f64 {
+        self.upload_rate.current()
     }
 
     pub fn closed(&self) -> bool {
@@ -689,7 +732,13 @@ fn spawn_sender(
                 _ = checker.stopped() => return,
                 result = timeout(queue_check_timeout, messages.recv()) => {
                     let message = match result {
-                        Ok(Some(message)) => message,
+                        Ok(Some(message)) => {
+                            if let Message::Piece { ref block, .. } = message {
+                                state.update_upload_rate(block.len() as u32);
+                            }
+
+                            message
+                        },
                         Err(_timeout) => Message::KeepAlive,
                         Ok(None) => break,
                     };
@@ -769,6 +818,8 @@ fn spawn_receiver(
                     begin,
                     block,
                 } => {
+                    state.update_download_rate(block.len() as u32);
+
                     let piece = block.into();
 
                     let piece_block = ReceivedPieceBlock {

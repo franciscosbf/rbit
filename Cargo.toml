@@ -16,6 +16,7 @@ trait-variant = "0.1"
 bytes = "1.6"
 leaky-bucket = "1.0"
 futures = "0.3"
+running-average = "0.1.0"
 
 [dependencies.tokio]
 version = "1"
