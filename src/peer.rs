@@ -263,7 +263,7 @@ pub enum Message {
     Choke,
     Unchoke,
     Interested,
-    NotIntersted,
+    NotInterested,
     Have {
         piece: u32,
     },
@@ -298,7 +298,7 @@ impl Message {
             Message::Choke => buff.extend_from_slice(&[0, 0, 0, 1, 0]),
             Message::Unchoke => buff.extend_from_slice(&[0, 0, 0, 1, 1]),
             Message::Interested => buff.extend_from_slice(&[0, 0, 0, 1, 2]),
-            Message::NotIntersted => buff.extend_from_slice(&[0, 0, 0, 1, 3]),
+            Message::NotInterested => buff.extend_from_slice(&[0, 0, 0, 1, 3]),
             Message::Have { piece } => {
                 buff.extend_from_slice(&[0, 0, 0, 5, 4]);
                 buff.extend_from_slice(&u32_to_bytes(piece));
@@ -355,7 +355,7 @@ impl Message {
             (0, 1) => Message::Choke,
             (1, 1) => Message::Unchoke,
             (2, 1) => Message::Interested,
-            (3, 1) => Message::NotIntersted,
+            (3, 1) => Message::NotInterested,
             (4, 5) => {
                 let piece = bytes_to_u32(content);
 
@@ -411,6 +411,7 @@ pub struct ReceivedPieceBlock {
     pub begin: u32,
     pub piece: FileBlock,
     pub peer_addr: PeerAddr,
+    pub client: PeerClient,
 }
 
 #[derive(Debug)]
@@ -419,11 +420,13 @@ pub struct PieceBlock {
     pub begin: u32,
     pub length: u32,
     pub peer_addr: PeerAddr,
+    pub client: PeerClient,
 }
 
 pub type PieceBlockRequest = PieceBlock;
 pub type CanceledPieceBlock = PieceBlock;
 
+#[derive(Debug)]
 struct Switch(AtomicBool);
 
 impl Switch {
@@ -444,6 +447,7 @@ impl Switch {
     }
 }
 
+#[derive(Debug)]
 struct StopperActor(watch::Sender<bool>);
 
 impl StopperActor {
@@ -470,6 +474,7 @@ fn stopper() -> (StopperActor, StopperCheck) {
     (actor, check)
 }
 
+#[derive(Debug)]
 struct ThroughputRate {
     average: Mutex<RealTimeRunningAverage<u32>>,
 }
@@ -492,9 +497,12 @@ impl ThroughputRate {
     }
 }
 
+#[derive(Debug)]
 pub struct PeerStateInner {
     am_choking: Switch,
     peer_interested: Switch,
+    peer_choking: Switch,
+    am_interested: Switch,
     upload_rate: ThroughputRate,
     download_rate: ThroughputRate,
     closed: Switch,
@@ -506,6 +514,8 @@ impl PeerStateInner {
         Self {
             am_choking: Switch::new(true),
             peer_interested: Switch::new(false),
+            peer_choking: Switch::new(true),
+            am_interested: Switch::new(false),
             upload_rate: ThroughputRate::new(),
             download_rate: ThroughputRate::new(),
             closed: Switch::new(false),
@@ -527,6 +537,22 @@ impl PeerStateInner {
 
     fn peer_uninsterest(&self) {
         self.peer_interested.unset();
+    }
+
+    fn peer_choking(&self) {
+        self.peer_choking.set();
+    }
+
+    fn peer_unchoking(&self) {
+        self.peer_choking.unset();
+    }
+
+    fn am_interest(&self) {
+        self.am_interested.set();
+    }
+
+    fn am_uninsterest(&self) {
+        self.am_interested.unset();
     }
 
     fn update_download_rate(&self, bytes: u32) {
@@ -555,6 +581,14 @@ impl PeerStateInner {
         self.peer_interested.current()
     }
 
+    pub fn peer_choking_me(&self) -> bool {
+        self.peer_choking.current()
+    }
+
+    pub fn am_interested(&self) -> bool {
+        self.am_interested.current()
+    }
+
     pub fn download_rate(&self) -> f64 {
         self.download_rate.current()
     }
@@ -568,7 +602,7 @@ impl PeerStateInner {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PeerState {
     inner: Arc<PeerStateInner>,
 }
@@ -733,8 +767,14 @@ fn spawn_sender(
                 result = timeout(queue_check_timeout, messages.recv()) => {
                     let message = match result {
                         Ok(Some(message)) => {
-                            if let Message::Piece { ref block, .. } = message {
-                                state.update_upload_rate(block.len() as u32);
+                            match message {
+                                Message::Piece { ref block, .. } =>
+                                    state.update_upload_rate(block.len() as u32),
+                                Message::Choke => state.peer_choking(),
+                                Message::Unchoke => state.peer_unchoking(),
+                                Message::Interested => state.am_interest(),
+                                Message::NotInterested => state.am_uninsterest(),
+                                _ => (),
                             }
 
                             message
@@ -755,6 +795,7 @@ fn spawn_sender(
 }
 
 fn spawn_receiver(
+    client: PeerClient,
     peer_addr: PeerAddr,
     mut reader: StreamReader,
     state: PeerState,
@@ -789,7 +830,7 @@ fn spawn_receiver(
                 Message::Choke => state.am_choking(),
                 Message::Unchoke => state.am_unchoking(),
                 Message::Interested => state.peer_interest(),
-                Message::NotIntersted => state.peer_uninsterest(),
+                Message::NotInterested => state.peer_uninsterest(),
                 Message::Have { piece } => bitfield.set(piece),
                 Message::Bitfield { pieces } => {
                     if !bitfield.append_overwrite(&pieces) {
@@ -801,11 +842,16 @@ fn spawn_receiver(
                     begin,
                     length,
                 } => {
+                    if state.peer_choking_me() {
+                        continue;
+                    }
+
                     let piece_block = PieceBlock {
                         index,
                         begin,
                         length,
                         peer_addr,
+                        client: client.clone(),
                     };
 
                     let cevents = events.clone();
@@ -820,13 +866,12 @@ fn spawn_receiver(
                 } => {
                     state.update_download_rate(block.len() as u32);
 
-                    let piece = block.into();
-
                     let piece_block = ReceivedPieceBlock {
                         index,
                         begin,
-                        piece,
+                        piece: block.into(),
                         peer_addr,
+                        client: client.clone(),
                     };
 
                     let cevents = events.clone();
@@ -844,6 +889,7 @@ fn spawn_receiver(
                         begin,
                         length,
                         peer_addr,
+                        client: client.clone(),
                     };
 
                     let cevents = events.clone();
@@ -864,10 +910,34 @@ fn calc_reader_buff_max_size(piece_size: u32, bitfield_chunks: u32) -> u32 {
         .max(bitfield_chunks)
 }
 
-pub struct PeerClient {
+#[derive(Debug)]
+pub struct PeerClientInner {
     state: PeerState,
     bitfield: PeerBitfield,
     messages_sender: mpsc::Sender<Message>,
+}
+
+impl PeerClientInner {
+    pub async fn send_message(&self, message: Message) -> bool {
+        self.messages_sender.send(message).await.is_ok()
+    }
+
+    pub fn has_piece(&self, index: u32) -> Option<bool> {
+        self.bitfield.has(index)
+    }
+}
+
+impl Deref for PeerClientInner {
+    type Target = PeerState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerClient {
+    inner: Arc<PeerClientInner>,
 }
 
 impl PeerClient {
@@ -905,38 +975,35 @@ impl PeerClient {
             Self::QUEUE_CHECK_TIMEOUT,
         );
 
+        let inner = PeerClientInner {
+            state: state.clone(),
+            bitfield: bitfield.clone(),
+            messages_sender,
+        };
+
+        let client = Self {
+            inner: Arc::new(inner),
+        };
+
         spawn_receiver(
+            client.clone(),
             peer_addr,
             reader,
-            state.clone(),
-            bitfield.clone(),
+            state,
+            bitfield,
             checker,
             senders,
         );
 
-        let client = PeerClient {
-            state,
-            bitfield,
-            messages_sender,
-        };
-
         Some(client)
-    }
-
-    pub async fn send_message(&self, message: Message) -> bool {
-        self.messages_sender.send(message).await.is_ok()
-    }
-
-    pub fn has_piece(&self, index: u32) -> Option<bool> {
-        self.bitfield.has(index)
     }
 }
 
 impl Deref for PeerClient {
-    type Target = PeerState;
+    type Target = PeerClientInner;
 
     fn deref(&self) -> &Self::Target {
-        &self.state
+        &self.inner
     }
 }
 
@@ -957,9 +1024,9 @@ mod tests {
 
     use super::{
         accepted_handshake, bitfield_chunks, spawn_receiver, spawn_sender, stopper, BitfieldIndex,
-        CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient, PeerId,
-        PeerState, PieceBlockRequest, ReceivedPieceBlock, StopperActor, StopperCheck, StreamRead,
-        StreamReader, StreamWriter, Switch,
+        CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient, PeerClientInner,
+        PeerId, PeerState, PieceBlockRequest, ReceivedPieceBlock, StopperActor, StopperCheck,
+        StreamRead, StreamReader, StreamWriter, Switch,
     };
 
     struct LocalListenerInner {
@@ -1175,12 +1242,30 @@ mod tests {
             peer_action(writer).await;
         });
 
+        let client = {
+            let (sender, _) = mpsc::channel(1);
+            PeerClient {
+                inner: Arc::new(PeerClientInner {
+                    state: state.clone(),
+                    bitfield: bitfield.clone(),
+                    messages_sender: sender,
+                }),
+            }
+        };
         let stream = listener.self_connect().await;
         let (reader, _) = stream.into_split();
         let stream_reader = StreamReader::new(reader, 69);
         let events = Arc::new(events);
 
-        let trcv = spawn_receiver(peer_addr, stream_reader, cstate, bitfield, checker, events);
+        let trcv = spawn_receiver(
+            client,
+            peer_addr,
+            stream_reader,
+            cstate,
+            bitfield,
+            checker,
+            events,
+        );
 
         assert_ok!(trcv.await);
 
@@ -1470,7 +1555,7 @@ mod tests {
     #[test]
     fn encode_not_interested_message() {
         let mut buff = vec![];
-        Message::NotIntersted.encode(&mut buff);
+        Message::NotInterested.encode(&mut buff);
 
         assert_eq!(buff, *b"\x00\x00\x00\x01\x03");
     }
@@ -1478,7 +1563,7 @@ mod tests {
     #[test]
     fn decode_not_interested_message() {
         let msg = assert_some!(Message::decode(b"\x03"));
-        assert_matches!(msg, Message::NotIntersted);
+        assert_matches!(msg, Message::NotInterested);
     }
 
     #[test]
@@ -1936,7 +2021,7 @@ mod tests {
                             length: 556,
                         },
                         Message::Choke,
-                        Message::NotIntersted,
+                        Message::NotInterested,
                     ];
 
                     for msg in msgs {
