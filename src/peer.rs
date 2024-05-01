@@ -19,7 +19,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{file::FileBlock, InfoHash, PeerAddr, Torrent};
+use crate::{file::FileBlock, InfoHash, Torrent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerId(pub [u8; 20]);
@@ -410,8 +410,7 @@ pub struct ReceivedPieceBlock {
     pub index: u32,
     pub begin: u32,
     pub piece: FileBlock,
-    pub peer_addr: PeerAddr,
-    pub client: PeerClient,
+    pub peer: PeerClient,
 }
 
 #[derive(Debug)]
@@ -419,8 +418,7 @@ pub struct PieceBlock {
     pub index: u32,
     pub begin: u32,
     pub length: u32,
-    pub peer_addr: PeerAddr,
-    pub client: PeerClient,
+    pub peer: PeerClient,
 }
 
 pub type PieceBlockRequest = PieceBlock;
@@ -796,7 +794,6 @@ fn spawn_sender(
 
 fn spawn_receiver(
     client: PeerClient,
-    peer_addr: PeerAddr,
     mut reader: StreamReader,
     state: PeerState,
     bitfield: PeerBitfield,
@@ -850,8 +847,7 @@ fn spawn_receiver(
                         index,
                         begin,
                         length,
-                        peer_addr,
-                        client: client.clone(),
+                        peer: client.clone(),
                     };
 
                     let cevents = events.clone();
@@ -870,8 +866,7 @@ fn spawn_receiver(
                         index,
                         begin,
                         piece: block.into(),
-                        peer_addr,
-                        client: client.clone(),
+                        peer: client.clone(),
                     };
 
                     let cevents = events.clone();
@@ -888,8 +883,7 @@ fn spawn_receiver(
                         index,
                         begin,
                         length,
-                        peer_addr,
-                        client: client.clone(),
+                        peer: client.clone(),
                     };
 
                     let cevents = events.clone();
@@ -956,8 +950,6 @@ impl PeerClient {
 
         let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
 
-        let peer_addr = stream.peer_addr().unwrap().into();
-
         let reader_buff_max_size =
             calc_reader_buff_max_size(torrent.piece_size as u32, bitfield.num_chunks());
 
@@ -985,15 +977,7 @@ impl PeerClient {
             inner: Arc::new(inner),
         };
 
-        spawn_receiver(
-            client.clone(),
-            peer_addr,
-            reader,
-            state,
-            bitfield,
-            checker,
-            senders,
-        );
+        spawn_receiver(client.clone(), reader, state, bitfield, checker, senders);
 
         Some(client)
     }
@@ -1009,7 +993,7 @@ impl Deref for PeerClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
@@ -1020,7 +1004,7 @@ mod tests {
     use futures::future::{BoxFuture, FutureExt};
     use url::Url;
 
-    use crate::{FileType, InfoHash, PeerAddr, Torrent};
+    use crate::{FileType, InfoHash, Torrent};
 
     use super::{
         accepted_handshake, bitfield_chunks, spawn_receiver, spawn_sender, stopper, BitfieldIndex,
@@ -1051,10 +1035,6 @@ mod tests {
             tokio::net::TcpStream::connect(format!("localhost:{}", self.port))
                 .await
                 .unwrap()
-        }
-
-        fn addr(&self) -> SocketAddr {
-            self.listener.local_addr().unwrap()
         }
     }
 
@@ -1221,7 +1201,7 @@ mod tests {
         peer_action: PF,
         events: impl Events + 'static,
     ) where
-        CF: FnOnce(PeerState, PeerBitfield, PeerAddr) -> BoxFuture<'static, ()> + Send + 'static,
+        CF: FnOnce(PeerState, PeerBitfield) -> BoxFuture<'static, ()> + Send + 'static,
         PF: FnOnce(tokio::net::tcp::OwnedWriteHalf) -> BoxFuture<'static, ()> + Send + 'static,
     {
         let listener = LocalListener::build().await;
@@ -1231,7 +1211,8 @@ mod tests {
         let state = PeerState::new(actor);
         let cstate = state.clone();
 
-        let peer_addr = listener.addr().into();
+        state.peer_unchoking();
+
         let bitfield = PeerBitfield::new(8);
         let cbitfield = bitfield.clone();
 
@@ -1257,19 +1238,11 @@ mod tests {
         let stream_reader = StreamReader::new(reader, 69);
         let events = Arc::new(events);
 
-        let trcv = spawn_receiver(
-            client,
-            peer_addr,
-            stream_reader,
-            cstate,
-            bitfield,
-            checker,
-            events,
-        );
+        let trcv = spawn_receiver(client, stream_reader, cstate, bitfield, checker, events);
 
         assert_ok!(trcv.await);
 
-        client_checker(state, cbitfield, peer_addr).await;
+        client_checker(state, cbitfield).await;
 
         assert_ok!(tpeer.await);
     }
@@ -2144,7 +2117,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _, _| {
+            |state, _| {
                 async move {
                     assert!(!state.am_choking_peer());
                 }
@@ -2168,7 +2141,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _, _| {
+            |state, _| {
                 async move {
                     assert!(state.am_choking_peer());
                 }
@@ -2193,7 +2166,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _, _| {
+            |state, _| {
                 async move {
                     assert!(state.peer_interested());
                 }
@@ -2217,7 +2190,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _, _| {
+            |state, _| {
                 async move {
                     assert!(!state.peer_interested());
                 }
@@ -2242,7 +2215,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, bitfield, _| {
+            |_, bitfield| {
                 async move {
                     assert_some_eq!(bitfield.has(3), true);
                 }
@@ -2270,7 +2243,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, bitfield, _| {
+            |_, bitfield| {
                 async move {
                     assert_eq!(bitfield.raw(), &[0b10010010]);
                 }
@@ -2296,7 +2269,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _, _| {
+            |state, _| {
                 async move {
                     let _ = sender.send(()).await;
                     assert!(state.closed());
@@ -2330,14 +2303,13 @@ mod tests {
         }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, _, peer_addr| {
+            |_, _| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
 
                     assert_eq!(msg.index, 43);
                     assert_eq!(msg.begin, 23);
                     assert_eq!(msg.length, 556);
-                    assert_eq!(msg.peer_addr, peer_addr);
                 }
                 .boxed()
             },
@@ -2374,14 +2346,13 @@ mod tests {
         }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, _, peer_addr| {
+            |_, _| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
 
                     assert_eq!(msg.index, 43);
                     assert_eq!(msg.begin, 23);
                     assert_eq!(msg.piece.0, b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95");
-                    assert_eq!(msg.peer_addr, peer_addr);
                 }
                 .boxed()
             },
@@ -2418,14 +2389,13 @@ mod tests {
         }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, _, peer_addr| {
+            |_, _| {
                 async move {
                     let msg = receiver.recv().await.unwrap();
 
                     assert_eq!(msg.index, 43);
                     assert_eq!(msg.begin, 23);
                     assert_eq!(msg.length, 556);
-                    assert_eq!(msg.peer_addr, peer_addr);
                 }
                 .boxed()
             },
@@ -2454,7 +2424,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _, _| {
+            |state, _| {
                 async move {
                     assert!(!state.am_choking_peer());
                 }
@@ -2481,7 +2451,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, _, _| {
+            |_, _| {
                 async move {
                     let _ = sender.send(()).await;
                 }
@@ -2513,7 +2483,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, _, _| async move {}.boxed(),
+            |_, _| async move {}.boxed(),
             |mut writer| {
                 async move {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x05").await);
@@ -2532,7 +2502,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _, _| {
+            |state, _| {
                 async move {
                     assert!(!state.am_choking_peer());
                 }
@@ -2559,7 +2529,7 @@ mod tests {
         impl Events for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _, _| {
+            |state, _| {
                 async move {
                     while !state.closed() {
                         tokio::time::sleep(Duration::from_secs(1)).await;
