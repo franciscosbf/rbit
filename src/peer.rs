@@ -623,13 +623,13 @@ impl Deref for PeerState {
 
 #[trait_variant::make(Send + Sync)]
 pub trait Events {
-    async fn requested_piece(&self, _piece_block: PieceBlockRequest) {
+    async fn on_requested_piece(&self, _piece_block: PieceBlockRequest) {
         async {}
     }
-    async fn received_piece_block(&self, _piece_block: ReceivedPieceBlock) {
+    async fn on_received_piece_block(&self, _piece_block: ReceivedPieceBlock) {
         async {}
     }
-    async fn canceled_piece(&self, _piece_block: CanceledPieceBlock) {
+    async fn on_canceled_piece(&self, _piece_block: CanceledPieceBlock) {
         async {}
     }
 }
@@ -852,7 +852,7 @@ fn spawn_receiver(
 
                     let cevents = events.clone();
                     tokio::spawn(async move {
-                        cevents.requested_piece(piece_block).await;
+                        cevents.on_requested_piece(piece_block).await;
                     });
                 }
                 Message::Piece {
@@ -871,7 +871,7 @@ fn spawn_receiver(
 
                     let cevents = events.clone();
                     tokio::spawn(async move {
-                        cevents.received_piece_block(piece_block).await;
+                        cevents.on_received_piece_block(piece_block).await;
                     });
                 }
                 Message::Cancel {
@@ -888,7 +888,7 @@ fn spawn_receiver(
 
                     let cevents = events.clone();
                     tokio::spawn(async move {
-                        cevents.canceled_piece(piece_block).await;
+                        cevents.on_canceled_piece(piece_block).await;
                     });
                 }
             }
@@ -2297,7 +2297,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn requested_piece(&self, piece_block: PieceBlockRequest) {
+            async fn on_requested_piece(&self, piece_block: PieceBlockRequest) {
                 let _ = self.sender.send(piece_block).await;
             }
         }
@@ -2340,7 +2340,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn received_piece_block(&self, piece_block: ReceivedPieceBlock) {
+            async fn on_received_piece_block(&self, piece_block: ReceivedPieceBlock) {
                 let _ = self.sender.send(piece_block).await;
             }
         }
@@ -2383,7 +2383,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn canceled_piece(&self, piece_block: CanceledPieceBlock) {
+            async fn on_canceled_piece(&self, piece_block: CanceledPieceBlock) {
                 let _ = self.sender.send(piece_block).await;
             }
         }
