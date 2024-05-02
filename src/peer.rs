@@ -19,7 +19,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{file::FileBlock, InfoHash, Torrent};
+use crate::{InfoHash, Torrent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerId(pub [u8; 20]);
@@ -409,7 +409,7 @@ impl Message {
 pub struct ReceivedPieceBlock {
     pub index: u32,
     pub begin: u32,
-    pub piece: FileBlock,
+    pub piece: Vec<u8>,
     pub peer: PeerClient,
 }
 
@@ -865,7 +865,7 @@ fn spawn_receiver(
                     let piece_block = ReceivedPieceBlock {
                         index,
                         begin,
-                        piece: block.into(),
+                        piece: block,
                         peer: client.clone(),
                     };
 
@@ -2352,7 +2352,7 @@ mod tests {
 
                     assert_eq!(msg.index, 43);
                     assert_eq!(msg.begin, 23);
-                    assert_eq!(msg.piece.0, b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95");
+                    assert_eq!(msg.piece, b"\xd9\x0c\x73\x24\x7c\xcb\xfc\xb6\x39\x95");
                 }
                 .boxed()
             },
