@@ -623,6 +623,18 @@ impl Deref for PeerState {
 
 #[trait_variant::make(Send + Sync)]
 pub trait Events {
+    async fn on_choked(&self, _peer: PeerClient) {
+        async {}
+    }
+    async fn on_unchoked(&self, _peer: PeerClient) {
+        async {}
+    }
+    async fn on_interested(&self, _peer: PeerClient) {
+        async {}
+    }
+    async fn on_not_interested(&self, _peer: PeerClient) {
+        async {}
+    }
     async fn on_requested_piece(&self, _piece_block: PieceBlockRequest) {
         async {}
     }
@@ -824,10 +836,26 @@ fn spawn_receiver(
 
             match message {
                 Message::KeepAlive => continue,
-                Message::Choke => state.am_choking(),
-                Message::Unchoke => state.am_unchoking(),
-                Message::Interested => state.peer_interest(),
-                Message::NotInterested => state.peer_uninsterest(),
+                Message::Choke => {
+                    state.am_choking();
+
+                    events.on_choked(client.clone()).await;
+                }
+                Message::Unchoke => {
+                    state.am_unchoking();
+
+                    events.on_unchoked(client.clone()).await;
+                }
+                Message::Interested => {
+                    state.peer_interest();
+
+                    events.on_interested(client.clone()).await;
+                }
+                Message::NotInterested => {
+                    state.peer_uninsterest();
+
+                    events.on_not_interested(client.clone()).await;
+                }
                 Message::Have { piece } => bitfield.set(piece),
                 Message::Bitfield { pieces } => {
                     if !bitfield.append_overwrite(&pieces) {
@@ -2112,13 +2140,23 @@ mod tests {
 
     #[tokio::test]
     async fn receiver_gets_unchoke_msg() {
-        struct EventsMock;
+        let (sender, mut receiver) = mpsc::channel(1);
 
-        impl Events for EventsMock {}
+        struct EventsMock {
+            sender: mpsc::Sender<()>,
+        }
+
+        impl Events for EventsMock {
+            async fn on_unchoked(&self, _peer: PeerClient) {
+                let _ = self.sender.send(()).await;
+            }
+        }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _| {
                 async move {
+                    let _ = receiver.recv().await;
+
                     assert!(!state.am_choking_peer());
                 }
                 .boxed()
@@ -2129,20 +2167,30 @@ mod tests {
                 }
                 .boxed()
             },
-            EventsMock,
+            EventsMock { sender },
         )
         .await;
     }
 
     #[tokio::test]
     async fn receiver_gets_choke_msg_after_unchoke_msg() {
-        struct EventsMock;
+        let (sender, mut receiver) = mpsc::channel(1);
 
-        impl Events for EventsMock {}
+        struct EventsMock {
+            sender: mpsc::Sender<()>,
+        }
+
+        impl Events for EventsMock {
+            async fn on_choked(&self, _peer: PeerClient) {
+                let _ = self.sender.send(()).await;
+            }
+        }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _| {
                 async move {
+                    let _ = receiver.recv().await;
+
                     assert!(state.am_choking_peer());
                 }
                 .boxed()
@@ -2154,20 +2202,30 @@ mod tests {
                 }
                 .boxed()
             },
-            EventsMock,
+            EventsMock { sender },
         )
         .await;
     }
 
     #[tokio::test]
     async fn receiver_gets_interested_msg() {
-        struct EventsMock;
+        let (sender, mut receiver) = mpsc::channel(1);
 
-        impl Events for EventsMock {}
+        struct EventsMock {
+            sender: mpsc::Sender<()>,
+        }
+
+        impl Events for EventsMock {
+            async fn on_interested(&self, _peer: PeerClient) {
+                let _ = self.sender.send(()).await;
+            }
+        }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _| {
                 async move {
+                    let _ = receiver.recv().await;
+
                     assert!(state.peer_interested());
                 }
                 .boxed()
@@ -2178,20 +2236,30 @@ mod tests {
                 }
                 .boxed()
             },
-            EventsMock,
+            EventsMock { sender },
         )
         .await;
     }
 
     #[tokio::test]
     async fn receiver_gets_not_interested_msg_after_interested_msg() {
-        struct EventsMock;
+        let (sender, mut receiver) = mpsc::channel(1);
 
-        impl Events for EventsMock {}
+        struct EventsMock {
+            sender: mpsc::Sender<()>,
+        }
+
+        impl Events for EventsMock {
+            async fn on_not_interested(&self, _peer: PeerClient) {
+                let _ = self.sender.send(()).await;
+            }
+        }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _| {
                 async move {
+                    let _ = receiver.recv().await;
+
                     assert!(!state.peer_interested());
                 }
                 .boxed()
@@ -2203,7 +2271,7 @@ mod tests {
                 }
                 .boxed()
             },
-            EventsMock,
+            EventsMock { sender },
         )
         .await;
     }
