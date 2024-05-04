@@ -6,9 +6,16 @@ use std::{
 
 use bendy::decoding::{Decoder, Error, FromBencode, Object, ResultExt};
 use sha1::{Digest, Sha1};
+use thiserror::Error;
 use url::Url;
 
-use crate::error::RbitError;
+#[derive(Error, Debug)]
+pub enum TorrentError {
+    #[error("invalid file")]
+    InvalidFile,
+    #[error("invalid value of field '{0}'")]
+    InvalidFieldValue(&'static str),
+}
 
 #[derive(Debug)]
 struct File {
@@ -213,13 +220,13 @@ impl HashPieces {
 }
 
 impl TryFrom<Vec<u8>> for HashPieces {
-    type Error = RbitError;
+    type Error = TorrentError;
 
     fn try_from(pieces: Vec<u8>) -> Result<Self, Self::Error> {
         if !pieces.is_empty() && pieces.len() % 20 == 0 {
             Ok(HashPieces { buf: pieces })
         } else {
-            Err(RbitError::InvalidFieldValue("info.pieces"))
+            Err(TorrentError::InvalidFieldValue("info.pieces"))
         }
     }
 }
@@ -301,30 +308,30 @@ impl Torrent {
 }
 
 impl TryFrom<MetaInfo> for Torrent {
-    type Error = RbitError;
+    type Error = TorrentError;
 
     fn try_from(file: MetaInfo) -> Result<Self, Self::Error> {
         let info = file.info;
 
         let tracker =
-            Url::parse(&file.announce).map_err(|_| RbitError::InvalidFieldValue("announce"))?;
+            Url::parse(&file.announce).map_err(|_| TorrentError::InvalidFieldValue("announce"))?;
 
         if !matches!(tracker.scheme(), "https" | "http") {
-            return Err(RbitError::InvalidFieldValue("announce"));
+            return Err(TorrentError::InvalidFieldValue("announce"));
         }
 
         let raw_name = info.name.strip_suffix('/').unwrap_or(&info.name);
-        let name =
-            PathBuf::from_str(raw_name).map_err(|_| RbitError::InvalidFieldValue("info.name"))?;
+        let name = PathBuf::from_str(raw_name)
+            .map_err(|_| TorrentError::InvalidFieldValue("info.name"))?;
 
         if name.parent() != Some(Path::new("")) || name.has_root() {
-            return Err(RbitError::InvalidFieldValue("info.name"));
+            return Err(TorrentError::InvalidFieldValue("info.name"));
         }
 
         let piece = if info.piece_length > 0 {
             info.piece_length
         } else {
-            return Err(RbitError::InvalidFieldValue("info.piece"));
+            return Err(TorrentError::InvalidFieldValue("info.piece"));
         };
 
         let hash_pieces = HashPieces::try_from(info.pieces)?;
@@ -334,7 +341,7 @@ impl TryFrom<MetaInfo> for Torrent {
                 let length = if length > 0 {
                     length
                 } else {
-                    return Err(RbitError::InvalidFieldValue("info.length"));
+                    return Err(TorrentError::InvalidFieldValue("info.length"));
                 };
                 let name = raw_name.to_string();
 
@@ -351,11 +358,11 @@ impl TryFrom<MetaInfo> for Torrent {
                             total_length += f.length;
                             f.length
                         } else {
-                            return Err(RbitError::InvalidFieldValue("info.files.length"));
+                            return Err(TorrentError::InvalidFieldValue("info.files.length"));
                         };
 
                         if f.path.is_empty() {
-                            return Err(RbitError::InvalidFieldValue("info.files.path"));
+                            return Err(TorrentError::InvalidFieldValue("info.files.path"));
                         }
 
                         let path = f.path.iter().collect::<PathBuf>();
@@ -364,25 +371,25 @@ impl TryFrom<MetaInfo> for Torrent {
                         let shift = start + (length + piece - 1) / piece;
                         let end = shift - 1;
                         if shift as usize > hash_pieces.len() {
-                            return Err(RbitError::InvalidFieldValue("info.pieces"));
+                            return Err(TorrentError::InvalidFieldValue("info.pieces"));
                         }
                         current = shift;
 
                         if path.starts_with(raw_name) {
                             Ok(FileMeta::new(length, start, end, path))
                         } else {
-                            Err(RbitError::InvalidFieldValue("info.files.path"))
+                            Err(TorrentError::InvalidFieldValue("info.files.path"))
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
                 if files.is_empty() {
-                    return Err(RbitError::InvalidFieldValue("info.files"));
+                    return Err(TorrentError::InvalidFieldValue("info.files"));
                 }
 
                 (FileType::Multi { dir, files }, total_length)
             }
-            _ => return Err(RbitError::InvalidFile),
+            _ => return Err(TorrentError::InvalidFile),
         };
 
         let info_hash = InfoHash::hash(file.raw_info.as_slice());
@@ -393,9 +400,9 @@ impl TryFrom<MetaInfo> for Torrent {
     }
 }
 
-pub fn parse(raw: &[u8]) -> Result<Torrent, RbitError> {
+pub fn parse(raw: &[u8]) -> Result<Torrent, TorrentError> {
     MetaInfo::from_bencode(raw)
-        .map_err(|_| RbitError::InvalidFile)?
+        .map_err(|_| TorrentError::InvalidFile)?
         .try_into()
 }
 
@@ -406,8 +413,7 @@ mod tests {
     use claims::{assert_matches, assert_none, assert_ok, assert_some_eq};
     use url::Url;
 
-    use super::{parse, FileType, HashPiece, HashPieces};
-    use crate::error::RbitError;
+    use super::{parse, FileType, HashPiece, HashPieces, TorrentError};
 
     #[test]
     fn get_pieces_chunk_wih_valid_chunk() {
@@ -520,7 +526,7 @@ mod tests {
         let raw = b"d8:announcei45e4:infod6:lengthi1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -528,7 +534,7 @@ mod tests {
         let raw = b"d8:announce19:udp://test.com:69694:infod6:lengthi1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFieldValue("announce")));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFieldValue("announce")));
     }
 
     #[test]
@@ -536,7 +542,7 @@ mod tests {
         let raw = b"d8:announce15:https//test.com4:infod6:lengthi1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFieldValue("announce")));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFieldValue("announce")));
     }
 
     #[test]
@@ -544,12 +550,15 @@ mod tests {
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi0e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFieldValue("info.length")));
+        assert_matches!(
+            parse(raw),
+            Err(TorrentError::InvalidFieldValue("info.length"))
+        );
 
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi-1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -557,7 +566,10 @@ mod tests {
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e\
             4:name5:/test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFieldValue("info.name")));
+        assert_matches!(
+            parse(raw),
+            Err(TorrentError::InvalidFieldValue("info.name"))
+        );
     }
 
     #[test]
@@ -565,12 +577,15 @@ mod tests {
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e\
             4:name4:test12:piece lengthi0e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFieldValue("info.piece")));
+        assert_matches!(
+            parse(raw),
+            Err(TorrentError::InvalidFieldValue("info.piece"))
+        );
 
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e\
             4:name4:test12:piece lengthi-1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -578,7 +593,10 @@ mod tests {
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e\
             4:name4:test12:piece lengthi1e6:pieces14:BBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFieldValue("info.pieces")));
+        assert_matches!(
+            parse(raw),
+            Err(TorrentError::InvalidFieldValue("info.pieces"))
+        );
     }
 
     #[test]
@@ -589,14 +607,14 @@ mod tests {
 
         assert_matches!(
             parse(raw),
-            Err(RbitError::InvalidFieldValue("info.files.length"))
+            Err(TorrentError::InvalidFieldValue("info.files.length"))
         );
 
         let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi1e\
             4:pathl5:tests5:test1eed6:lengthi-1e4:pathl5:tests5:test2eee4:name5:tests\
             12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -607,14 +625,14 @@ mod tests {
 
         assert_matches!(
             parse(raw),
-            Err(RbitError::InvalidFieldValue("info.files.path"))
+            Err(TorrentError::InvalidFieldValue("info.files.path"))
         );
 
         let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi1e\
             4:pathl6:/tests5:test1eed6:lengthi-1e4:pathl5:tests5:test2eee4:name5:tests\
             12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -625,7 +643,10 @@ mod tests {
             AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA\
             BBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFieldValue("info.pieces")));
+        assert_matches!(
+            parse(raw),
+            Err(TorrentError::InvalidFieldValue("info.pieces"))
+        );
     }
 
     #[test]
@@ -634,7 +655,7 @@ mod tests {
             4:pathl5:tests5:test1eed6:lengthi1e4:pathl5:tests5:test2eee6:lengthi2e\
             4:name5:tests12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -642,6 +663,6 @@ mod tests {
         let raw = b"d8:announce16:https://test.com4:infod4:name5:tests12:piece lengthi2e\
             6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(RbitError::InvalidFile));
+        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
     }
 }

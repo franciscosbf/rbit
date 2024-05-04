@@ -3,6 +3,7 @@ use futures::{future::Future, task::Poll};
 use leaky_bucket::RateLimiter;
 use running_average::RealTimeRunningAverage;
 use std::{
+    net::SocketAddr,
     ops::Deref,
     pin::Pin,
     sync::{
@@ -12,6 +13,7 @@ use std::{
     task::Context,
     time::Duration,
 };
+use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp, TcpStream},
@@ -20,6 +22,12 @@ use tokio::{
 };
 
 use crate::{InfoHash, Torrent};
+
+#[derive(Error, Debug)]
+pub enum PeerError {
+    #[error("invalid handshake from peer '{0}'")]
+    InvalidHandshake(SocketAddr),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerId(pub [u8; 20]);
@@ -980,9 +988,10 @@ impl PeerClient {
         mut stream: TcpStream,
         torrent: Arc<Torrent>,
         senders: Arc<impl Events + 'static>,
-    ) -> Option<Self> {
+    ) -> Result<Self, PeerError> {
         if !accepted_handshake(handshake, &mut stream).await {
-            return None;
+            let socket = stream.peer_addr().unwrap();
+            return Err(PeerError::InvalidHandshake(socket));
         }
 
         let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
@@ -1016,7 +1025,7 @@ impl PeerClient {
 
         spawn_receiver(client.clone(), reader, state, bitfield, checker, senders);
 
-        Some(client)
+        Ok(client)
     }
 }
 
@@ -1032,7 +1041,7 @@ impl Deref for PeerClient {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use claims::{assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
+    use claims::{assert_err, assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
@@ -1046,8 +1055,8 @@ mod tests {
     use super::{
         accepted_handshake, bitfield_chunks, spawn_receiver, spawn_sender, stopper, BitfieldIndex,
         CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient, PeerClientInner,
-        PeerId, PeerState, PieceBlockRequest, ReceivedPieceBlock, StopperActor, StopperCheck,
-        StreamRead, StreamReader, StreamWriter, Switch,
+        PeerError, PeerId, PeerState, PieceBlockRequest, ReceivedPieceBlock, StopperActor,
+        StopperCheck, StreamRead, StreamReader, StreamWriter, Switch,
     };
 
     struct LocalListenerInner {
@@ -1284,7 +1293,10 @@ mod tests {
         assert_ok!(tpeer.await);
     }
 
-    async fn validate_client<CF, PF>(client_controller: CF, peer_receiver: PF) -> bool
+    async fn validate_client<CF, PF>(
+        client_controller: CF,
+        peer_receiver: PF,
+    ) -> Result<(), PeerError>
     where
         CF: FnOnce(PeerClient) -> BoxFuture<'static, ()> + Send + 'static,
         PF: FnOnce(
@@ -1327,10 +1339,7 @@ mod tests {
         let senders = Arc::new(EventsMock);
         let stream = listener.self_connect().await;
 
-        let pcli = match PeerClient::start(handshake, stream, torrent, senders).await {
-            Some(pcli) => pcli,
-            None => return false,
-        };
+        let pcli = PeerClient::start(handshake, stream, torrent, senders).await?;
 
         let tcli = tokio::spawn(async move {
             client_controller(pcli).await;
@@ -1340,7 +1349,7 @@ mod tests {
 
         assert_ok!(tcli.await);
 
-        true
+        Ok(())
     }
 
     #[test]
@@ -2682,33 +2691,37 @@ mod tests {
     async fn send_through_client_choke_and_keep_alive_due_to_inactivity() {
         let (sender, mut receiver) = mpsc::channel(1);
 
-        assert!(
+        assert_ok!(
             validate_client(
-                |peer_client| async move {
-                    peer_client.send_message(Message::Choke).await;
+                |peer_client| {
+                    async move {
+                        peer_client.send_message(Message::Choke).await;
 
-                    receiver.recv().await;
-                }
-                .boxed(),
-                |handshake, mut reader, mut writer| async move {
-                    let mut buff = vec![0; handshake.raw().len()];
-                    assert_ok!(reader.read_exact(&mut buff).await);
+                        receiver.recv().await;
+                    }
+                    .boxed()
+                },
+                |handshake, mut reader, mut writer| {
+                    async move {
+                        let mut buff = vec![0; handshake.raw().len()];
+                        assert_ok!(reader.read_exact(&mut buff).await);
 
-                    assert_eq!(handshake.raw(), buff);
+                        assert_eq!(handshake.raw(), buff);
 
-                    assert_ok!(writer.write_all(&buff).await);
+                        assert_ok!(writer.write_all(&buff).await);
 
-                    let mut buff = vec![69; 5];
-                    assert_ok!(reader.read_exact(&mut buff).await);
-                    assert_eq!(buff, [0, 0, 0, 1, 0]);
+                        let mut buff = vec![69; 5];
+                        assert_ok!(reader.read_exact(&mut buff).await);
+                        assert_eq!(buff, [0, 0, 0, 1, 0]);
 
-                    let mut buff = vec![69; 4];
-                    assert_ok!(reader.read_exact(&mut buff).await);
-                    assert_eq!(buff, [0, 0, 0, 0]);
+                        let mut buff = vec![69; 4];
+                        assert_ok!(reader.read_exact(&mut buff).await);
+                        assert_eq!(buff, [0, 0, 0, 0]);
 
-                    let _ = sender.send(()).await;
-                }
-                .boxed(),
+                        let _ = sender.send(()).await;
+                    }
+                    .boxed()
+                },
             )
             .await
         );
@@ -2716,20 +2729,22 @@ mod tests {
 
     #[tokio::test]
     async fn client_receives_invalid_handshake() {
-        assert!(
-            !validate_client(
+        assert_err!(
+            validate_client(
                 |_| async move {}.boxed(),
-                |handshake, mut reader, mut writer| async move {
-                    let mut buff = vec![0; handshake.raw().len()];
-                    assert_ok!(reader.read_exact(&mut buff).await);
+                |handshake, mut reader, mut writer| {
+                    async move {
+                        let mut buff = vec![0; handshake.raw().len()];
+                        assert_ok!(reader.read_exact(&mut buff).await);
 
-                    assert_eq!(handshake.raw(), buff);
+                        assert_eq!(handshake.raw(), buff);
 
-                    assert_ok!(writer.write_all(&[69, 69, 69]).await);
-                }
-                .boxed(),
+                        assert_ok!(writer.write_all(&[69, 69, 69]).await);
+                    }
+                    .boxed()
+                },
             )
-            .await
+            .await,
         );
     }
 }

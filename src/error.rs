@@ -1,17 +1,13 @@
 use thiserror::Error;
 
+use crate::{PeerError, TorrentError, TrackerError};
+
 #[derive(Error, Debug)]
 pub enum RbitError {
-    #[error("Invalid Torrent file")]
-    InvalidFile,
-    #[error("Invalid value of field `{0}`")]
-    InvalidFieldValue(&'static str),
-    #[error("Error trying get peers: {0}")]
-    TrackerFailed(#[from] reqwest::Error),
-    #[error("Invalid tracker response")]
-    InvalidTrackerResponse,
-    #[error("Invalid peers data: {0}")]
-    InvalidPeers(&'static str),
-    #[error("Tracker returned an error: {0}")]
-    TrackerErrorResponse(String),
+    #[error(transparent)]
+    Tracker(#[from] TrackerError),
+    #[error(transparent)]
+    Torrent(#[from] TorrentError),
+    #[error(transparent)]
+    Peer(#[from] PeerError),
 }

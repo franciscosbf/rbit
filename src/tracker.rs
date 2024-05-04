@@ -6,9 +6,22 @@ use std::{
 };
 
 use bendy::decoding::{Error, FromBencode, Object};
+use thiserror::Error;
 use url::{Host, Url};
 
-use crate::{error::RbitError, InfoHash, PeerId};
+use crate::{InfoHash, PeerId};
+
+#[derive(Error, Debug)]
+pub enum TrackerError {
+    #[error("error trying get peers: {0}")]
+    RequestFailed(#[from] reqwest::Error),
+    #[error("invalid tracker response")]
+    InvalidTrackerResponse,
+    #[error("peers parser error: {0}")]
+    PeersParserFailed(&'static str),
+    #[error("tracker error: {0}")]
+    TrackerErrorResponse(String),
+}
 
 fn bytes_to_str(raw: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(raw) }
@@ -190,28 +203,29 @@ impl Deref for PeerAddr {
 }
 
 impl TryFrom<Peer> for PeerAddr {
-    type Error = RbitError;
+    type Error = TrackerError;
 
     fn try_from(peer: Peer) -> Result<Self, Self::Error> {
         let port = peer.port;
-        let ip =
-            match Host::parse(&peer.ip).map_err(|_| RbitError::InvalidPeers("invalid peer ip"))? {
-                Host::Domain(domain) => (domain, 0)
-                    .to_socket_addrs()
-                    .map_err(|_| RbitError::InvalidPeers("domain lookup failed"))?
-                    .next()
-                    .map(|saddr| saddr.ip())
-                    .ok_or(RbitError::InvalidPeers("unknown domain ip"))?,
-                Host::Ipv4(ip) => IpAddr::V4(ip),
-                Host::Ipv6(ip) => IpAddr::V6(ip),
-            };
+        let ip = match Host::parse(&peer.ip)
+            .map_err(|_| TrackerError::PeersParserFailed("invalid peer ip"))?
+        {
+            Host::Domain(domain) => (domain, 0)
+                .to_socket_addrs()
+                .map_err(|_| TrackerError::PeersParserFailed("domain lookup failed"))?
+                .next()
+                .map(|saddr| saddr.ip())
+                .ok_or(TrackerError::PeersParserFailed("unknown domain ip"))?,
+            Host::Ipv4(ip) => IpAddr::V4(ip),
+            Host::Ipv6(ip) => IpAddr::V6(ip),
+        };
 
         Ok(SocketAddr::new(ip, port).into())
     }
 }
 
 impl TryFrom<&[u8]> for PeerAddr {
-    type Error = RbitError;
+    type Error = TrackerError;
 
     fn try_from(raw: &[u8]) -> Result<Self, Self::Error> {
         let ipv4 = Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]);
@@ -238,11 +252,11 @@ impl Peers {
 }
 
 impl TryFrom<TrackerResponse> for Peers {
-    type Error = RbitError;
+    type Error = TrackerError;
 
     fn try_from(response: TrackerResponse) -> Result<Self, Self::Error> {
         match (response.failure, response.success) {
-            (Some(error), _) => Err(RbitError::TrackerErrorResponse(error)),
+            (Some(error), _) => Err(TrackerError::TrackerErrorResponse(error)),
             (None, Some(msg)) => {
                 let interval = msg.interval.into();
 
@@ -250,24 +264,26 @@ impl TryFrom<TrackerResponse> for Peers {
                     PeersFormat::Simple(ready) => ready
                         .into_iter()
                         .map(|peer| peer.try_into())
-                        .collect::<Result<_, RbitError>>()?,
+                        .collect::<Result<_, TrackerError>>()?,
                     PeersFormat::Compact(raw) => {
                         const CPEER_SZ: usize = 6;
 
                         if raw.len() % CPEER_SZ != 0 {
-                            return Err(RbitError::InvalidPeers("invalid peers compact format"));
+                            return Err(TrackerError::PeersParserFailed(
+                                "invalid peers compact format",
+                            ));
                         }
 
                         (0..raw.len())
                             .step_by(CPEER_SZ)
                             .map(|i| (&raw[i..i + CPEER_SZ]).try_into())
-                            .collect::<Result<_, RbitError>>()?
+                            .collect::<Result<_, TrackerError>>()?
                     }
                 };
 
                 Ok(Peers::new(interval, addresses))
             }
-            _ => Err(RbitError::InvalidPeers("peers are missing")),
+            _ => Err(TrackerError::PeersParserFailed("peers are missing")),
         }
     }
 }
@@ -306,7 +322,7 @@ impl TrackerClient {
         downloaded: usize,
         left: usize,
         event: Event,
-    ) -> Result<Peers, RbitError> {
+    ) -> Result<Peers, TrackerError> {
         let body = self
             .http_client
             .get(self.base_url.as_str())
@@ -317,15 +333,15 @@ impl TrackerClient {
             .query(&[("event", event.as_str())])
             .send()
             .await
-            .map_err(RbitError::TrackerFailed)?
+            .map_err(TrackerError::RequestFailed)?
             .error_for_status()
-            .map_err(RbitError::TrackerFailed)?
+            .map_err(TrackerError::RequestFailed)?
             .bytes()
             .await
-            .map_err(RbitError::TrackerFailed)?;
+            .map_err(TrackerError::RequestFailed)?;
 
         TrackerResponse::from_bencode(&body)
-            .map_err(|_| RbitError::InvalidTrackerResponse)?
+            .map_err(|_| TrackerError::InvalidTrackerResponse)?
             .try_into()
     }
 }
@@ -345,9 +361,9 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
-    use crate::{error::RbitError, InfoHash, PeerAddr, PeerId, TrackerClient};
+    use crate::{InfoHash, PeerAddr, PeerId, TrackerClient};
 
-    use super::{Interval, Peer, Peers, PeersFormat, Success, TrackerResponse};
+    use super::{Interval, Peer, Peers, PeersFormat, Success, TrackerError, TrackerResponse};
 
     #[test]
     fn parse_failure_response() {
@@ -399,7 +415,7 @@ mod tests {
 
     #[test]
     fn parse_valid_interval() {
-        let interval: Interval = assert_ok!(1_u64.try_into());
+        let interval: Interval = 1_u64.into();
 
         assert_eq!(*interval, Duration::from_secs(1));
     }
@@ -444,7 +460,7 @@ mod tests {
                 ip: "192.145.--.34".into(),
                 port: 45,
             }),
-            Err(RbitError::InvalidPeers("invalid peer ip"))
+            Err(TrackerError::PeersParserFailed("invalid peer ip"))
         );
 
         assert_matches!(
@@ -452,7 +468,7 @@ mod tests {
                 ip: "[0:0:0:00:ffff:c00a:2ff]".into(),
                 port: 45,
             }),
-            Err(RbitError::InvalidPeers("invalid peer ip"))
+            Err(TrackerError::PeersParserFailed("invalid peer ip"))
         );
 
         assert_matches!(
@@ -460,7 +476,7 @@ mod tests {
                 ip: "localhost.invalid".into(),
                 port: 45,
             }),
-            Err(RbitError::InvalidPeers("domain lookup failed"))
+            Err(TrackerError::PeersParserFailed("domain lookup failed"))
         );
 
         // WARN: idk how to test domain resolution result without returned ips.
@@ -538,7 +554,7 @@ mod tests {
 
     #[test]
     fn convert_valid_tracker_response_with_error_message() {
-        let _error = RbitError::TrackerErrorResponse("test".into());
+        let _error = TrackerError::TrackerErrorResponse("test".into());
 
         assert_matches!(
             <TrackerResponse as TryInto<Peers>>::try_into(TrackerResponse {
@@ -556,7 +572,7 @@ mod tests {
                 failure: None,
                 success: None,
             }),
-            Err(RbitError::InvalidPeers("peers are missing"))
+            Err(TrackerError::PeersParserFailed("peers are missing"))
         );
     }
 
@@ -570,7 +586,9 @@ mod tests {
                     peers: PeersFormat::Compact(Vec::from(&[192, 145, 21, 34, 0][..])),
                 }),
             }),
-            Err(RbitError::InvalidPeers("invalid peers compact format"))
+            Err(TrackerError::PeersParserFailed(
+                "invalid peers compact format"
+            ))
         );
     }
 
