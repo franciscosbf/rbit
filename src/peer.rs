@@ -440,6 +440,12 @@ impl Switch {
         self.0.store(false, Ordering::Release);
     }
 
+    fn set_if_not(&self) -> bool {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
     fn current(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
@@ -562,11 +568,9 @@ impl PeerStateInner {
     }
 
     fn close(&self) {
-        if self.closed() {
+        if !self.closed.set_if_not() {
             return;
         }
-
-        self.closed.set();
 
         self.actor.stop();
     }
@@ -642,6 +646,9 @@ pub trait Events {
         async {}
     }
     async fn on_canceled_piece(&self, _piece_block: CanceledPieceBlock) {
+        async {}
+    }
+    async fn on_closed(&self, _peer: PeerClient) {
         async {}
     }
 }
@@ -818,7 +825,7 @@ fn spawn_receiver(
 
         loop {
             let read = tokio::select! {
-                _ = checker.stopped() => return,
+                _ = checker.stopped() => break,
                 read = reader.next_message() => read,
             };
 
@@ -923,6 +930,10 @@ fn spawn_receiver(
         }
 
         state.close();
+
+        tokio::spawn(async move {
+            events.on_closed(client).await;
+        });
     })
 }
 
@@ -1713,8 +1724,14 @@ mod tests {
         switch.set();
         assert!(switch.current());
 
+        assert!(!switch.set_if_not());
+        assert!(switch.current());
+
         switch.unset();
         assert!(!switch.current());
+
+        assert!(switch.set_if_not());
+        assert!(switch.current());
     }
 
     async fn validate_stopper<F>(action: F)
@@ -2330,16 +2347,25 @@ mod tests {
 
     #[tokio::test]
     async fn receiver_gets_different_bitfield() {
+        let (sender_coord, mut receiver_coord) = mpsc::channel(1);
         let (sender, mut receiver) = mpsc::channel(1);
 
-        struct EventsMock;
+        struct EventsMock {
+            sender: mpsc::Sender<()>,
+        }
 
-        impl Events for EventsMock {}
+        impl Events for EventsMock {
+            async fn on_closed(&self, _peer: PeerClient) {
+                let _ = self.sender.send(()).await;
+            }
+        }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _| {
                 async move {
-                    let _ = sender.send(()).await;
+                    let _ = receiver.recv().await;
+
+                    let _ = sender_coord.send(()).await;
                     assert!(state.closed());
                 }
                 .boxed()
@@ -2347,11 +2373,11 @@ mod tests {
             |mut writer| {
                 async move {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x03\x05\x92\x23").await);
-                    receiver.recv().await;
+                    receiver_coord.recv().await;
                 }
                 .boxed()
             },
-            EventsMock,
+            EventsMock { sender },
         )
         .await;
     }
@@ -2512,16 +2538,25 @@ mod tests {
 
     #[tokio::test]
     async fn receiver_gets_msg_with_size_bigger_than_the_buffer() {
+        let (sender_coord, mut receiver_coord) = mpsc::channel(1);
         let (sender, mut receiver) = mpsc::channel(1);
 
-        struct EventsMock;
+        struct EventsMock {
+            sender: mpsc::Sender<()>,
+        }
 
-        impl Events for EventsMock {}
+        impl Events for EventsMock {
+            async fn on_closed(&self, _peer: PeerClient) {
+                let _ = self.sender.send(()).await;
+            }
+        }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, _| {
                 async move {
-                    let _ = sender.send(()).await;
+                    let _ = receiver.recv().await;
+
+                    let _ = sender_coord.send(()).await;
                 }
                 .boxed()
             },
@@ -2535,30 +2570,43 @@ mod tests {
                             )
                             .await
                     );
-                    receiver.recv().await;
+                    receiver_coord.recv().await;
                 }
                 .boxed()
             },
-            EventsMock,
+            EventsMock { sender },
         )
         .await;
     }
 
     #[tokio::test]
     async fn receiver_does_not_get_the_entire_message() {
-        struct EventsMock;
+        let (sender, mut receiver) = mpsc::channel(1);
 
-        impl Events for EventsMock {}
+        struct EventsMock {
+            sender: mpsc::Sender<()>,
+        }
+
+        impl Events for EventsMock {
+            async fn on_closed(&self, _peer: PeerClient) {
+                let _ = self.sender.send(()).await;
+            }
+        }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |_, _| async move {}.boxed(),
+            |_, _| {
+                async move {
+                    let _ = receiver.recv().await;
+                }
+                .boxed()
+            },
             |mut writer| {
                 async move {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x05").await);
                 }
                 .boxed()
             },
-            EventsMock,
+            EventsMock { sender },
         )
         .await;
     }
@@ -2591,10 +2639,17 @@ mod tests {
     #[tokio::test]
     async fn receiver_gets_4_invalid_messages_and_closes_connection_after_4th_message() {
         let (sender, mut receiver) = mpsc::channel(1);
+        let (sender_coord, mut receiver_coord) = mpsc::channel(1);
 
-        struct EventsMock;
+        struct EventsMock {
+            sender: mpsc::Sender<()>,
+        }
 
-        impl Events for EventsMock {}
+        impl Events for EventsMock {
+            async fn on_closed(&self, _peer: PeerClient) {
+                let _ = self.sender.send(()).await;
+            }
+        }
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _| {
@@ -2603,7 +2658,9 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
 
-                    let _ = sender.send(()).await;
+                    let _ = receiver.recv().await;
+
+                    let _ = sender_coord.send(()).await;
                 }
                 .boxed()
             },
@@ -2614,11 +2671,11 @@ mod tests {
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
                     assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
 
-                    receiver.recv().await;
+                    receiver_coord.recv().await;
                 }
                 .boxed()
             },
-            EventsMock,
+            EventsMock { sender },
         )
         .await;
     }
