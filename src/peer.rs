@@ -931,9 +931,7 @@ fn spawn_receiver(
 
         state.close();
 
-        tokio::spawn(async move {
-            events.on_close(client).await;
-        });
+        events.on_close(client).await;
     })
 }
 
