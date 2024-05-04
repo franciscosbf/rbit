@@ -627,28 +627,28 @@ impl Deref for PeerState {
 
 #[trait_variant::make(Send + Sync)]
 pub trait Events {
-    async fn on_choked(&self, _peer: PeerClient) {
+    async fn on_choke(&self, _peer: PeerClient) {
         async {}
     }
-    async fn on_unchoked(&self, _peer: PeerClient) {
+    async fn on_unchoke(&self, _peer: PeerClient) {
         async {}
     }
-    async fn on_interested(&self, _peer: PeerClient) {
+    async fn on_interest(&self, _peer: PeerClient) {
         async {}
     }
-    async fn on_not_interested(&self, _peer: PeerClient) {
+    async fn on_not_interest(&self, _peer: PeerClient) {
         async {}
     }
-    async fn on_requested_piece(&self, _piece_block: PieceBlockRequest) {
+    async fn on_piece_block_request(&self, _piece_block: PieceBlockRequest) {
         async {}
     }
     async fn on_received_piece_block(&self, _piece_block: ReceivedPieceBlock) {
         async {}
     }
-    async fn on_canceled_piece(&self, _piece_block: CanceledPieceBlock) {
+    async fn on_canceled_piece_block(&self, _piece_block: CanceledPieceBlock) {
         async {}
     }
-    async fn on_closed(&self, _peer: PeerClient) {
+    async fn on_close(&self, _peer: PeerClient) {
         async {}
     }
 }
@@ -846,22 +846,22 @@ fn spawn_receiver(
                 Message::Choke => {
                     state.am_choking();
 
-                    events.on_choked(client.clone()).await;
+                    events.on_choke(client.clone()).await;
                 }
                 Message::Unchoke => {
                     state.am_unchoking();
 
-                    events.on_unchoked(client.clone()).await;
+                    events.on_unchoke(client.clone()).await;
                 }
                 Message::Interested => {
                     state.peer_interest();
 
-                    events.on_interested(client.clone()).await;
+                    events.on_interest(client.clone()).await;
                 }
                 Message::NotInterested => {
                     state.peer_uninsterest();
 
-                    events.on_not_interested(client.clone()).await;
+                    events.on_not_interest(client.clone()).await;
                 }
                 Message::Have { piece } => bitfield.set(piece),
                 Message::Bitfield { pieces } => {
@@ -887,7 +887,7 @@ fn spawn_receiver(
 
                     let cevents = events.clone();
                     tokio::spawn(async move {
-                        cevents.on_requested_piece(piece_block).await;
+                        cevents.on_piece_block_request(piece_block).await;
                     });
                 }
                 Message::Piece {
@@ -923,7 +923,7 @@ fn spawn_receiver(
 
                     let cevents = events.clone();
                     tokio::spawn(async move {
-                        cevents.on_canceled_piece(piece_block).await;
+                        cevents.on_canceled_piece_block(piece_block).await;
                     });
                 }
             }
@@ -932,7 +932,7 @@ fn spawn_receiver(
         state.close();
 
         tokio::spawn(async move {
-            events.on_closed(client).await;
+            events.on_close(client).await;
         });
     })
 }
@@ -2164,7 +2164,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_unchoked(&self, _peer: PeerClient) {
+            async fn on_unchoke(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2198,7 +2198,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_choked(&self, _peer: PeerClient) {
+            async fn on_choke(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2233,7 +2233,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_interested(&self, _peer: PeerClient) {
+            async fn on_interest(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2267,7 +2267,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_not_interested(&self, _peer: PeerClient) {
+            async fn on_not_interest(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2355,7 +2355,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_closed(&self, _peer: PeerClient) {
+            async fn on_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2391,7 +2391,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_requested_piece(&self, piece_block: PieceBlockRequest) {
+            async fn on_piece_block_request(&self, piece_block: PieceBlockRequest) {
                 let _ = self.sender.send(piece_block).await;
             }
         }
@@ -2477,7 +2477,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_canceled_piece(&self, piece_block: CanceledPieceBlock) {
+            async fn on_canceled_piece_block(&self, piece_block: CanceledPieceBlock) {
                 let _ = self.sender.send(piece_block).await;
             }
         }
@@ -2546,7 +2546,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_closed(&self, _peer: PeerClient) {
+            async fn on_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2588,7 +2588,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_closed(&self, _peer: PeerClient) {
+            async fn on_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2646,7 +2646,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_closed(&self, _peer: PeerClient) {
+            async fn on_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
