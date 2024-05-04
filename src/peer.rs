@@ -634,7 +634,7 @@ impl Deref for PeerState {
 }
 
 #[trait_variant::make(Send + Sync)]
-pub trait Events {
+pub trait Events: 'static {
     async fn on_choke(&self, _peer: PeerClient) {
         async {}
     }
@@ -819,14 +819,17 @@ fn spawn_sender(
     });
 }
 
-fn spawn_receiver(
+fn spawn_receiver<E>(
     client: PeerClient,
     mut reader: StreamReader,
     state: PeerState,
     bitfield: PeerBitfield,
     mut checker: StopperCheck,
-    events: Arc<impl Events + 'static>,
-) -> tokio::task::JoinHandle<()> {
+    events: Arc<E>,
+) -> tokio::task::JoinHandle<()>
+where
+    E: Events,
+{
     tokio::spawn(async move {
         let keep_tolerating = ReceiverTolerance::new();
         tokio::pin!(keep_tolerating);
@@ -983,12 +986,15 @@ impl PeerClient {
     const BUFFERED_MESSAGES: usize = 40;
     const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(4000);
 
-    pub async fn start(
+    pub async fn start<E>(
         handshake: Arc<Handshake>,
         mut stream: TcpStream,
         torrent: Arc<Torrent>,
-        senders: Arc<impl Events + 'static>,
-    ) -> Result<Self, PeerError> {
+        senders: Arc<E>,
+    ) -> Result<Self, PeerError>
+    where
+        E: Events,
+    {
         if !accepted_handshake(handshake, &mut stream).await {
             let socket = stream.peer_addr().unwrap();
             return Err(PeerError::InvalidHandshake(socket));
