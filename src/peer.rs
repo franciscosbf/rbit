@@ -17,8 +17,8 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp, TcpStream},
-    sync::{mpsc, watch},
-    time::timeout,
+    sync::{watch, Notify},
+    time::{sleep_until, Instant},
 };
 
 use crate::{InfoHash, Torrent};
@@ -708,6 +708,7 @@ impl StreamReader {
     }
 }
 
+#[derive(Debug)]
 struct StreamWriter {
     writer: tcp::OwnedWriteHalf,
     buffer: Vec<u8>,
@@ -778,37 +779,20 @@ impl Future for ReceiverTolerance {
     }
 }
 
-fn spawn_sender(
-    mut writer: StreamWriter,
+fn spawn_heartbeat(
+    writer: Arc<tokio::sync::Mutex<StreamWriter>>,
     state: PeerState,
     mut checker: StopperCheck,
-    mut messages: mpsc::Receiver<Message>,
-    queue_check_timeout: Duration,
+    timeout: Duration,
+    reset_signal: Arc<Notify>,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = checker.stopped() => return,
-                result = timeout(queue_check_timeout, messages.recv()) => {
-                    let message = match result {
-                        Ok(Some(message)) => {
-                            match message {
-                                Message::Piece { ref block, .. } =>
-                                    state.update_upload_rate(block.len() as u32),
-                                Message::Choke => state.peer_choking(),
-                                Message::Unchoke => state.peer_unchoking(),
-                                Message::Interested => state.am_interest(),
-                                Message::NotInterested => state.am_uninsterest(),
-                                _ => (),
-                            }
-
-                            message
-                        },
-                        Err(_timeout) => Message::KeepAlive,
-                        Ok(None) => break,
-                    };
-
-                    if writer.send(message).await.is_err() {
+                _ = reset_signal.notified() => continue,
+                _ = sleep_until(Instant::now() + timeout) => {
+                    if writer.lock().await.send(Message::KeepAlive).await.is_err() {
                         break;
                     }
                 }
@@ -818,6 +802,47 @@ fn spawn_sender(
         state.close();
     });
 }
+
+// fn spawn_sender(
+//     mut writer: StreamWriter,
+//     state: PeerState,
+//     mut checker: StopperCheck,
+//     mut messages: mpsc::Receiver<Message>,
+//     queue_check_timeout: Duration,
+// ) {
+//     tokio::spawn(async move {
+//         loop {
+//             tokio::select! {
+//                 _ = checker.stopped() => return,
+//                 result = timeout(queue_check_timeout, messages.recv()) => {
+//                     let message = match result {
+//                         Ok(Some(message)) => {
+//                             match message {
+//                                 Message::Piece { ref block, .. } =>
+//                                     state.update_upload_rate(block.len() as u32),
+//                                 Message::Choke => state.peer_choking(),
+//                                 Message::Unchoke => state.peer_unchoking(),
+//                                 Message::Interested => state.am_interest(),
+//                                 Message::NotInterested => state.am_uninsterest(),
+//                                 _ => (),
+//                             }
+//
+//                             message
+//                         },
+//                         Err(_timeout) => Message::KeepAlive,
+//                         Ok(None) => break,
+//                     };
+//
+//                     if writer.send(message).await.is_err() {
+//                         break;
+//                     }
+//                 }
+//             }
+//         }
+//
+//         state.close();
+//     });
+// }
 
 fn spawn_receiver<E>(
     client: PeerClient,
@@ -956,12 +981,34 @@ fn calc_reader_buff_max_size(piece_size: u32, bitfield_chunks: u32) -> u32 {
 pub struct PeerClientInner {
     state: PeerState,
     bitfield: PeerBitfield,
-    messages_sender: mpsc::Sender<Message>,
+    writer: Arc<tokio::sync::Mutex<StreamWriter>>,
+    heartbeat_reset: Arc<Notify>,
 }
 
 impl PeerClientInner {
     pub async fn send_message(&self, message: Message) -> bool {
-        self.messages_sender.send(message).await.is_ok()
+        if self.state.closed() {
+            return false;
+        }
+
+        match message {
+            Message::Piece { ref block, .. } => self.state.update_upload_rate(block.len() as u32),
+            Message::Choke => self.state.peer_choking(),
+            Message::Unchoke => self.state.peer_unchoking(),
+            Message::Interested => self.state.am_interest(),
+            Message::NotInterested => self.state.am_uninsterest(),
+            _ => (),
+        }
+
+        if self.writer.lock().await.send(message).await.is_err() {
+            self.state.close();
+
+            return false;
+        }
+
+        self.heartbeat_reset.notify_one();
+
+        true
     }
 
     pub fn has_piece(&self, index: u32) -> Option<bool> {
@@ -983,8 +1030,7 @@ pub struct PeerClient {
 }
 
 impl PeerClient {
-    const BUFFERED_MESSAGES: usize = 40;
-    const QUEUE_CHECK_TIMEOUT: Duration = Duration::from_millis(4000);
+    const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(4000);
 
     pub async fn start<E>(
         handshake: Arc<Handshake>,
@@ -1009,20 +1055,24 @@ impl PeerClient {
         let state = PeerState::new(actor);
 
         let (reader, writer) = split_stream(stream, reader_buff_max_size);
-        let (messages_sender, messages_receiver) = mpsc::channel(Self::BUFFERED_MESSAGES);
 
-        spawn_sender(
-            writer,
+        let writer = Arc::new(tokio::sync::Mutex::new(writer));
+
+        let heartbeat_reset = Arc::new(Notify::new());
+
+        spawn_heartbeat(
+            writer.clone(),
             state.clone(),
             checker.clone(),
-            messages_receiver,
-            Self::QUEUE_CHECK_TIMEOUT,
+            Self::HEARTBEAT_TIMEOUT,
+            heartbeat_reset.clone(),
         );
 
         let inner = PeerClientInner {
             state: state.clone(),
             bitfield: bitfield.clone(),
-            messages_sender,
+            writer,
+            heartbeat_reset,
         };
 
         let client = Self {
@@ -1050,7 +1100,7 @@ mod tests {
     use claims::{assert_err, assert_matches, assert_none, assert_ok, assert_some, assert_some_eq};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        sync::mpsc,
+        sync::{mpsc, Notify},
     };
 
     use futures::future::{BoxFuture, FutureExt};
@@ -1059,10 +1109,10 @@ mod tests {
     use crate::{FileType, InfoHash, Torrent};
 
     use super::{
-        accepted_handshake, bitfield_chunks, spawn_receiver, spawn_sender, stopper, BitfieldIndex,
+        accepted_handshake, bitfield_chunks, spawn_receiver, stopper, BitfieldIndex,
         CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient, PeerClientInner,
         PeerError, PeerId, PeerState, PieceBlockRequest, ReceivedPieceBlock, StopperActor,
-        StopperCheck, StreamRead, StreamReader, StreamWriter, Switch,
+        StreamRead, StreamReader, StreamWriter, Switch,
     };
 
     struct LocalListenerInner {
@@ -1206,47 +1256,47 @@ mod tests {
         assert_ok!(tcli.await)
     }
 
-    async fn validate_spawn_sender<CF, PF>(
-        client_action: CF,
-        peer_action: PF,
-        sender_buffer_sz: usize,
-        queue_check_timeout: Duration,
-    ) where
-        CF: FnOnce(mpsc::Sender<Message>, PeerState) -> BoxFuture<'static, ()> + Send + 'static,
-        PF: FnOnce(tokio::net::tcp::OwnedReadHalf, StopperCheck) -> BoxFuture<'static, ()>
-            + Send
-            + 'static,
-    {
-        let listener = LocalListener::build().await;
-        let clistener = listener.clone();
-
-        let (actor, checker) = stopper();
-        let cchecker = checker.clone();
-        let state = PeerState::new(actor);
-        let cstate = state.clone();
-
-        let tpeer = tokio::spawn(async move {
-            let stream = clistener.accept().await;
-            let (reader, _) = stream.into_split();
-
-            peer_action(reader, cchecker).await;
-        });
-
-        let stream = listener.self_connect().await;
-        let (_, writer) = stream.into_split();
-        let stream_writer = StreamWriter::new(writer);
-        let (sender, receiver) = mpsc::channel(sender_buffer_sz);
-
-        spawn_sender(stream_writer, state, checker, receiver, queue_check_timeout);
-
-        let tcli = tokio::spawn(async move {
-            client_action(sender, cstate).await;
-        });
-
-        assert_ok!(tpeer.await);
-
-        assert_ok!(tcli.await);
-    }
+    // async fn validate_spawn_sender<CF, PF>(
+    //     client_action: CF,
+    //     peer_action: PF,
+    //     sender_buffer_sz: usize,
+    //     heartbeat_timeout: Duration,
+    // ) where
+    //     CF: FnOnce(mpsc::Sender<Message>, PeerState) -> BoxFuture<'static, ()> + Send + 'static,
+    //     PF: FnOnce(tokio::net::tcp::OwnedReadHalf, StopperCheck) -> BoxFuture<'static, ()>
+    //         + Send
+    //         + 'static,
+    // {
+    //     let listener = LocalListener::build().await;
+    //     let clistener = listener.clone();
+    //
+    //     let (actor, checker) = stopper();
+    //     let cchecker = checker.clone();
+    //     let state = PeerState::new(actor);
+    //     let cstate = state.clone();
+    //
+    //     let tpeer = tokio::spawn(async move {
+    //         let stream = clistener.accept().await;
+    //         let (reader, _) = stream.into_split();
+    //
+    //         peer_action(reader, cchecker).await;
+    //     });
+    //
+    //     let stream = listener.self_connect().await;
+    //     let (_, writer) = stream.into_split();
+    //     let stream_writer = StreamWriter::new(writer);
+    //     let (sender, receiver) = mpsc::channel(sender_buffer_sz);
+    //
+    //     // spawn_sender(stream_writer, state, checker, receiver, queue_check_timeout);
+    //
+    //     let tcli = tokio::spawn(async move {
+    //         client_action(sender, cstate).await;
+    //     });
+    //
+    //     assert_ok!(tpeer.await);
+    //
+    //     assert_ok!(tcli.await);
+    // }
 
     async fn validate_spawn_receiver_with_8_pieces_and_69_of_buff_size<CF, PF>(
         client_checker: CF,
@@ -1275,18 +1325,16 @@ mod tests {
             peer_action(writer).await;
         });
 
-        let client = {
-            let (sender, _) = mpsc::channel(1);
-            PeerClient {
-                inner: Arc::new(PeerClientInner {
-                    state: state.clone(),
-                    bitfield: bitfield.clone(),
-                    messages_sender: sender,
-                }),
-            }
-        };
         let stream = listener.self_connect().await;
-        let (reader, _) = stream.into_split();
+        let (reader, writer) = stream.into_split();
+        let client = PeerClient {
+            inner: Arc::new(PeerClientInner {
+                state: state.clone(),
+                bitfield: bitfield.clone(),
+                writer: Arc::new(tokio::sync::Mutex::new(StreamWriter::new(writer))),
+                heartbeat_reset: Arc::new(Notify::new()),
+            }),
+        };
         let stream_reader = StreamReader::new(reader, 69);
         let events = Arc::new(events);
 
@@ -2040,135 +2088,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sender_transmits_messages_to_peer() {
-        validate_spawn_sender(
-            |sender, _| {
-                async move {
-                    let msgs = [
-                        Message::Unchoke,
-                        Message::Request {
-                            index: 43,
-                            begin: 23,
-                            length: 556,
-                        },
-                        Message::Choke,
-                        Message::NotInterested,
-                    ];
-
-                    for msg in msgs {
-                        assert_ok!(sender.send(msg).await);
-                    }
-                }
-                .boxed()
-            },
-            |mut reader, _| {
-                async move {
-                    let raw_msgs = [
-                        b"\x00\x00\x00\x01\x01".to_vec(),
-                        b"\x00\x00\x00\x0d\x06\x00\x00\x00\x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
-                            .to_vec(),
-                        b"\x00\x00\x00\x01\x00".to_vec(),
-                        b"\x00\x00\x00\x01\x03".to_vec(),
-                    ];
-
-                    for msg in raw_msgs {
-                        let mut buffer = vec![0; msg.len()];
-
-                        assert_ok!(
-                            reader.read_exact(buffer.as_mut_slice()).await,
-                            "failed to read message: {:#04X?}",
-                            msg
-                        );
-                        assert_eq!(msg, buffer);
-                    }
-                }
-                .boxed()
-            },
-            4,
-            Duration::from_secs(3600),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn sender_stops_on_explicit_close() {
-        validate_spawn_sender(
-            |_, state| {
-                async move {
-                    state.close();
-                }
-                .boxed()
-            },
-            |mut reader, mut checker| {
-                async move {
-                    checker.stopped().await;
-
-                    let error = reader.read_u8().await.unwrap_err();
-                    assert_matches!(error.kind(), tokio::io::ErrorKind::UnexpectedEof);
-                }
-                .boxed()
-            },
-            4,
-            Duration::from_secs(3600),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn sender_stops_on_connection_closed() {
-        validate_spawn_sender(
-            |_, _| async move {}.boxed(),
-            |reader, mut checker| {
-                async move {
-                    std::mem::drop(reader);
-
-                    checker.stopped().await;
-                }
-                .boxed()
-            },
-            1,
-            Duration::from_secs(3600),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn sender_transmits_keep_alive_on_timeout() {
-        validate_spawn_sender(
-            |sender, _| {
-                async move {
-                    let _ = sender.send(Message::Unchoke).await;
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                }
-                .boxed()
-            },
-            |mut reader, _| {
-                async move {
-                    let raw_msgs = [
-                        b"\x00\x00\x00\x01\x01".to_vec(),
-                        b"\x00\x00\x00\x00".to_vec(),
-                    ];
-
-                    for msg in raw_msgs {
-                        let mut buffer = vec![0; msg.len()];
-
-                        assert_ok!(
-                            reader.read_exact(buffer.as_mut_slice()).await,
-                            "failed to read message: {:#04X?}",
-                            msg
-                        );
-                        assert_eq!(msg, buffer);
-                    }
-                }
-                .boxed()
-            },
-            1,
-            Duration::from_secs(2),
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn receiver_gets_unchoke_msg() {
         let (sender, mut receiver) = mpsc::channel(1);
 
@@ -2695,15 +2614,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_through_client_choke_and_keep_alive_due_to_inactivity() {
-        let (sender, mut receiver) = mpsc::channel(1);
-
         assert_ok!(
             validate_client(
-                |peer_client| {
+                |client| {
                     async move {
-                        peer_client.send_message(Message::Choke).await;
-
-                        receiver.recv().await;
+                        assert!(client.send_message(Message::Choke).await);
                     }
                     .boxed()
                 },
@@ -2723,8 +2638,6 @@ mod tests {
                         let mut buff = vec![69; 4];
                         assert_ok!(reader.read_exact(&mut buff).await);
                         assert_eq!(buff, [0, 0, 0, 0]);
-
-                        let _ = sender.send(()).await;
                     }
                     .boxed()
                 },
@@ -2751,6 +2664,127 @@ mod tests {
                 },
             )
             .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn client_transmits_messages_to_peer() {
+        assert_ok!(
+            validate_client(
+                |client| {
+                    async move {
+                        let msgs = [
+                            Message::Unchoke,
+                            Message::Request {
+                                index: 43,
+                                begin: 23,
+                                length: 556,
+                            },
+                            Message::Choke,
+                            Message::NotInterested,
+                        ];
+
+                        for msg in msgs {
+                            assert!(client.send_message(msg).await);
+                        }
+                    }
+                    .boxed()
+                },
+                |handshake, mut reader, mut writer| {
+                    async move {
+                        let mut buff = vec![0; handshake.raw().len()];
+                        assert_ok!(reader.read_exact(&mut buff).await);
+
+                        assert_eq!(handshake.raw(), buff);
+
+                        assert_ok!(writer.write_all(&buff).await);
+
+                        let raw_msgs = [
+                            b"\x00\x00\x00\x01\x01".to_vec(),
+                            b"\x00\x00\x00\x0d\x06\x00\x00\x00\x2b\x00\x00\x00\x17\x00\x00\x02\x2c"
+                                .to_vec(),
+                            b"\x00\x00\x00\x01\x00".to_vec(),
+                            b"\x00\x00\x00\x01\x03".to_vec(),
+                        ];
+
+                        for msg in raw_msgs {
+                            let mut buffer = vec![0; msg.len()];
+
+                            assert_ok!(
+                                reader.read_exact(buffer.as_mut_slice()).await,
+                                "failed to read message: {:#04X?}",
+                                msg
+                            );
+                            assert_eq!(msg, buffer);
+                        }
+                    }
+                    .boxed()
+                },
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn client_stops_on_explicit_close() {
+        assert_ok!(
+            validate_client(
+                |client| {
+                    async move {
+                        client.close();
+                    }
+                    .boxed()
+                },
+                |handshake, mut reader, mut writer| {
+                    async move {
+                        let mut buff = vec![0; handshake.raw().len()];
+                        assert_ok!(reader.read_exact(&mut buff).await);
+
+                        assert_eq!(handshake.raw(), buff);
+
+                        assert_ok!(writer.write_all(&buff).await);
+
+                        let error = reader.read_u8().await.unwrap_err();
+                        assert_matches!(error.kind(), tokio::io::ErrorKind::UnexpectedEof);
+                    }
+                    .boxed()
+                },
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn client_stops_on_connection_closed() {
+        assert_ok!(
+            validate_client(
+                |client| {
+                    async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+
+                            if client.closed() {
+                                break;
+                            }
+                        }
+
+                        assert!(!client.send_message(Message::KeepAlive).await);
+                    }
+                    .boxed()
+                },
+                |handshake, mut reader, mut writer| {
+                    async move {
+                        let mut buff = vec![0; handshake.raw().len()];
+                        assert_ok!(reader.read_exact(&mut buff).await);
+
+                        assert_eq!(handshake.raw(), buff);
+
+                        assert_ok!(writer.write_all(&buff).await);
+                    }
+                    .boxed()
+                },
+            )
+            .await
         );
     }
 }
