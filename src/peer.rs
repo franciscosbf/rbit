@@ -575,12 +575,14 @@ impl PeerStateInner {
         self.upload_rate.update(bytes);
     }
 
-    fn close(&self) {
+    fn close(&self) -> bool {
         if !self.closed.set_if_not() {
-            return;
+            return false;
         }
 
         self.actor.stop();
+
+        true
     }
 
     pub fn am_choking_peer(&self) -> bool {
@@ -656,7 +658,7 @@ pub trait Events: 'static {
     async fn on_canceled_piece_block(&self, _piece_block: CanceledPieceBlock) {
         async {}
     }
-    async fn on_close(&self, _peer: PeerClient) {
+    async fn on_implicit_close(&self, _peer: PeerClient) {
         async {}
     }
 }
@@ -779,13 +781,27 @@ impl Future for ReceiverTolerance {
     }
 }
 
-fn spawn_heartbeat(
+async fn close_connection_and_call_its_event<E>(client: PeerClient, events: Arc<E>)
+where
+    E: Events,
+{
+    if !client.close() {
+        return;
+    }
+
+    events.on_implicit_close(client).await;
+}
+
+fn spawn_heartbeat<E>(
+    client: PeerClient,
     writer: Arc<tokio::sync::Mutex<StreamWriter>>,
-    state: PeerState,
     mut checker: StopperCheck,
     timeout: Duration,
     reset_signal: Arc<Notify>,
-) {
+    events: Arc<E>,
+) where
+    E: Events,
+{
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -793,13 +809,13 @@ fn spawn_heartbeat(
                 _ = reset_signal.notified() => continue,
                 _ = sleep_until(Instant::now() + timeout) => {
                     if writer.lock().await.send(Message::KeepAlive).await.is_err() {
-                        break;
+                        close_connection_and_call_its_event(client, events).await;
+
+                        return;
                     }
                 }
             }
         }
-
-        state.close();
     });
 }
 
@@ -820,7 +836,7 @@ where
 
         loop {
             let read = tokio::select! {
-                _ = checker.stopped() => break,
+                _ = checker.stopped() => return,
                 read = reader.next_message() => read,
             };
 
@@ -924,9 +940,7 @@ where
             }
         }
 
-        state.close();
-
-        events.on_close(client).await;
+        close_connection_and_call_its_event(client, events).await;
     })
 }
 
@@ -995,7 +1009,7 @@ impl PeerClient {
         handshake: Arc<Handshake>,
         mut stream: TcpStream,
         torrent: Arc<Torrent>,
-        senders: Arc<E>,
+        events: Arc<E>,
     ) -> Result<Self, PeerError>
     where
         E: Events,
@@ -1019,26 +1033,27 @@ impl PeerClient {
 
         let heartbeat_reset = Arc::new(Notify::new());
 
-        spawn_heartbeat(
-            writer.clone(),
-            state.clone(),
-            checker.clone(),
-            Self::HEARTBEAT_TIMEOUT,
-            heartbeat_reset.clone(),
-        );
-
         let inner = PeerClientInner {
             state: state.clone(),
             bitfield: bitfield.clone(),
-            writer,
-            heartbeat_reset,
+            writer: writer.clone(),
+            heartbeat_reset: heartbeat_reset.clone(),
         };
 
         let client = Self {
             inner: Arc::new(inner),
         };
 
-        spawn_receiver(client.clone(), reader, state, bitfield, checker, senders);
+        spawn_heartbeat(
+            client.clone(),
+            writer,
+            checker.clone(),
+            Self::HEARTBEAT_TIMEOUT,
+            heartbeat_reset,
+            events.clone(),
+        );
+
+        spawn_receiver(client.clone(), reader, state, bitfield, checker, events);
 
         Ok(client)
     }
@@ -2204,7 +2219,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_close(&self, _peer: PeerClient) {
+            async fn on_implicit_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2395,7 +2410,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_close(&self, _peer: PeerClient) {
+            async fn on_implicit_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2437,7 +2452,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_close(&self, _peer: PeerClient) {
+            async fn on_implicit_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
@@ -2495,7 +2510,7 @@ mod tests {
         }
 
         impl Events for EventsMock {
-            async fn on_close(&self, _peer: PeerClient) {
+            async fn on_implicit_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
         }
