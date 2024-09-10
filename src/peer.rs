@@ -803,47 +803,6 @@ fn spawn_heartbeat(
     });
 }
 
-// fn spawn_sender(
-//     mut writer: StreamWriter,
-//     state: PeerState,
-//     mut checker: StopperCheck,
-//     mut messages: mpsc::Receiver<Message>,
-//     queue_check_timeout: Duration,
-// ) {
-//     tokio::spawn(async move {
-//         loop {
-//             tokio::select! {
-//                 _ = checker.stopped() => return,
-//                 result = timeout(queue_check_timeout, messages.recv()) => {
-//                     let message = match result {
-//                         Ok(Some(message)) => {
-//                             match message {
-//                                 Message::Piece { ref block, .. } =>
-//                                     state.update_upload_rate(block.len() as u32),
-//                                 Message::Choke => state.peer_choking(),
-//                                 Message::Unchoke => state.peer_unchoking(),
-//                                 Message::Interested => state.am_interest(),
-//                                 Message::NotInterested => state.am_uninsterest(),
-//                                 _ => (),
-//                             }
-//
-//                             message
-//                         },
-//                         Err(_timeout) => Message::KeepAlive,
-//                         Ok(None) => break,
-//                     };
-//
-//                     if writer.send(message).await.is_err() {
-//                         break;
-//                     }
-//                 }
-//             }
-//         }
-//
-//         state.close();
-//     });
-// }
-
 fn spawn_receiver<E>(
     client: PeerClient,
     mut reader: StreamReader,
@@ -1255,48 +1214,6 @@ mod tests {
 
         assert_ok!(tcli.await)
     }
-
-    // async fn validate_spawn_sender<CF, PF>(
-    //     client_action: CF,
-    //     peer_action: PF,
-    //     sender_buffer_sz: usize,
-    //     heartbeat_timeout: Duration,
-    // ) where
-    //     CF: FnOnce(mpsc::Sender<Message>, PeerState) -> BoxFuture<'static, ()> + Send + 'static,
-    //     PF: FnOnce(tokio::net::tcp::OwnedReadHalf, StopperCheck) -> BoxFuture<'static, ()>
-    //         + Send
-    //         + 'static,
-    // {
-    //     let listener = LocalListener::build().await;
-    //     let clistener = listener.clone();
-    //
-    //     let (actor, checker) = stopper();
-    //     let cchecker = checker.clone();
-    //     let state = PeerState::new(actor);
-    //     let cstate = state.clone();
-    //
-    //     let tpeer = tokio::spawn(async move {
-    //         let stream = clistener.accept().await;
-    //         let (reader, _) = stream.into_split();
-    //
-    //         peer_action(reader, cchecker).await;
-    //     });
-    //
-    //     let stream = listener.self_connect().await;
-    //     let (_, writer) = stream.into_split();
-    //     let stream_writer = StreamWriter::new(writer);
-    //     let (sender, receiver) = mpsc::channel(sender_buffer_sz);
-    //
-    //     // spawn_sender(stream_writer, state, checker, receiver, queue_check_timeout);
-    //
-    //     let tcli = tokio::spawn(async move {
-    //         client_action(sender, cstate).await;
-    //     });
-    //
-    //     assert_ok!(tpeer.await);
-    //
-    //     assert_ok!(tcli.await);
-    // }
 
     async fn validate_spawn_receiver_with_8_pieces_and_69_of_buff_size<CF, PF>(
         client_checker: CF,
