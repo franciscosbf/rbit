@@ -17,10 +17,11 @@ bytes = "1.6"
 leaky-bucket = "1.0"
 futures = "0.3"
 running-average = "0.1.0"
+dashmap = "6.1.0"
 
 [dependencies.tokio]
 version = "1"
-features = ["macros", "rt", "rt-multi-thread", "net", "sync", "io-util"]
+features = ["macros", "rt", "rt-multi-thread", "net", "sync", "io-util", "fs"]
 
 [dependencies.rand]
 version = "0.8.5"
@@ -29,3 +30,4 @@ features = ["std", "std_rng"]
 [dev-dependencies]
 claims = "0.7.1"
 wiremock = "0.6.0"
+rand = "0.8.5"
