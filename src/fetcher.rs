@@ -62,11 +62,11 @@ impl Chunk {
 }
 
 #[derive(Debug)]
-pub struct FetcherInner {
+pub struct FileHandler {
     handler: fs::File,
 }
 
-impl FetcherInner {
+impl FileHandler {
     fn new(handler: fs::File) -> Self {
         Self { handler }
     }
@@ -123,13 +123,16 @@ impl FetcherInner {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Fetcher {
-    inner: Arc<tokio::sync::Mutex<FetcherInner>>,
+#[derive(Debug)]
+struct FetcherInner {
+    handler: tokio::sync::Mutex<FileHandler>,
     path: PathBuf,
     file_size: u64,
     block_size: u64,
 }
+
+#[derive(Debug, Clone)]
+pub struct Fetcher(Arc<FetcherInner>);
 
 impl Fetcher {
     pub async fn create(
@@ -137,29 +140,31 @@ impl Fetcher {
         file_size: u64,
         block_size: u64,
     ) -> Result<Self, FetcherError> {
-        let inner = Arc::new(tokio::sync::Mutex::new(
-            FetcherInner::create(&path, file_size)
+        let handler = tokio::sync::Mutex::new(
+            FileHandler::create(&path, file_size)
                 .await
                 .map_err(|e| FetcherError::io_error(&path, e))?,
-        ));
+        );
 
         let path = path.as_ref().into();
 
-        Ok(Self {
-            inner,
+        let inner = Arc::new(FetcherInner {
+            handler,
             path,
             file_size,
             block_size,
-        })
+        });
+
+        Ok(Self(inner))
     }
 
     fn to_io_error(&self, source: io::Error) -> FetcherError {
-        FetcherError::io_error(self.path.as_path(), source)
+        FetcherError::io_error(self.0.path.as_path(), source)
     }
 
     fn block_offset(&self, index: u64) -> Result<u64, FetcherError> {
-        let (offset, overflow) = index.overflowing_mul(self.block_size);
-        if overflow || offset >= self.file_size {
+        let (offset, overflow) = index.overflowing_mul(self.0.block_size);
+        if overflow || offset >= self.0.file_size {
             return Err(FetcherError::InvalidBlockOffset);
         }
 
@@ -170,7 +175,7 @@ impl Fetcher {
         let block_offset = self.block_offset(index)?;
 
         let (offset, overflow) = block_offset.overflowing_add(begin);
-        if overflow || offset >= self.file_size {
+        if overflow || offset >= self.0.file_size {
             return Err(FetcherError::InvalidChunkOffset);
         }
 
@@ -181,11 +186,12 @@ impl Fetcher {
         let offset = self.chunk_offset(chunk.index, chunk.begin)?;
 
         let (end, overflow) = offset.overflowing_add(chunk.length);
-        if overflow || end > self.file_size {
+        if overflow || end > self.0.file_size {
             return Err(FetcherError::InvalidChunkSize);
         }
 
-        self.inner
+        self.0
+            .handler
             .lock()
             .await
             .read_chunk(offset, chunk.length)
@@ -196,7 +202,8 @@ impl Fetcher {
     pub async fn write_block(&self, block: Block) -> Result<(), FetcherError> {
         let offset = self.block_offset(block.index)?;
 
-        self.inner
+        self.0
+            .handler
             .lock()
             .await
             .write_block(offset, &block.data)
@@ -205,7 +212,8 @@ impl Fetcher {
     }
 
     pub async fn flush(&self) -> Result<(), FetcherError> {
-        self.inner
+        self.0
+            .handler
             .lock()
             .await
             .flush()
