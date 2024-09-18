@@ -30,4 +30,3 @@ features = ["std", "std_rng"]
 [dev-dependencies]
 claims = "0.7.1"
 wiremock = "0.6.0"
-rand = "0.8.5"
