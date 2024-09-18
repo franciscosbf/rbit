@@ -60,6 +60,7 @@ enum Operation {
         offset: u64,
         data: Vec<u8>,
     },
+    Stop,
 }
 
 #[trait_variant::make(Send + Sync)]
@@ -85,13 +86,15 @@ fn spawn_file_handler<E>(
 
         loop {
             let op = match operations_receiver.recv_async().await {
-                Ok(op) => op,
+                Ok(Operation::Stop) => break,
                 Err(flume::RecvError::Disconnected) => break,
+                Ok(op) => op,
             };
 
             let offset = match op {
                 Operation::Read { offset, .. } => offset,
                 Operation::Write { offset, .. } => offset,
+                _ => unreachable!(),
             };
             if let Err(e) = handler.seek(io::SeekFrom::Start(offset)).await {
                 fire_io_error(e).await;
@@ -123,6 +126,7 @@ fn spawn_file_handler<E>(
 
                     events.on_write(index).await;
                 }
+                _ => unreachable!(),
             }
         }
 
@@ -171,6 +175,10 @@ impl FileHandler {
         Ok(fetcher)
     }
 
+    async fn send_op(&self, op: Operation) -> Result<(), flume::SendError<Operation>> {
+        self.operations_sender.send_async(op).await
+    }
+
     async fn read_chunk(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
         let (chunk_sender, chunk_receiver) = oneshot::channel();
 
@@ -179,7 +187,7 @@ impl FileHandler {
             length,
             chunk_sender,
         };
-        self.operations_sender.send_async(op).await.ok()?;
+        self.send_op(op).await.ok()?;
 
         chunk_receiver.await.ok()
     }
@@ -190,7 +198,11 @@ impl FileHandler {
             offset,
             data,
         };
-        self.operations_sender.send_async(op).await.is_ok()
+        self.send_op(op).await.is_ok()
+    }
+
+    async fn request_stop(&self) -> bool {
+        self.send_op(Operation::Stop).await.is_ok()
     }
 }
 
@@ -244,6 +256,10 @@ impl FetcherInner {
             .await
             .then_some(())
             .ok_or(FetcherError::FileHandlerStopped)
+    }
+
+    pub async fn request_stop(&self) -> bool {
+        self.handler.request_stop().await
     }
 }
 
@@ -524,5 +540,28 @@ mod tests {
             if e.kind() == io::ErrorKind::UnexpectedEof);
 
         assert!(operations_sender.is_disconnected());
+    }
+
+    #[tokio::test]
+    async fn fail_to_read_and_write_when_file_handler_is_stopped() {
+        let fetcher = create_fetcher_without_event_handlers().await;
+
+        assert!(fetcher.request_stop().await);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let chunk = Chunk::new(1, 0, 32);
+        assert_matches!(
+            fetcher.read_chunk(chunk).await,
+            Err(FetcherError::FileHandlerStopped)
+        );
+
+        let block = Block::new(1, vec![2; 32]);
+        assert_matches!(
+            fetcher.request_block_write(block).await,
+            Err(FetcherError::FileHandlerStopped)
+        );
+
+        assert!(!fetcher.request_stop().await);
     }
 }
