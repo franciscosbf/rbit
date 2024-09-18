@@ -19,6 +19,11 @@ futures = "0.3"
 running-average = "0.1.0"
 dashmap = "6.1.0"
 
+[dependencies.flume]
+version = "0.11.0"
+default-features = false
+features = ["async", "select"]
+
 [dependencies.tokio]
 version = "1"
 features = ["macros", "rt", "rt-multi-thread", "net", "sync", "io-util", "fs"]

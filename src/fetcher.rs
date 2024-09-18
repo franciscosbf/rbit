@@ -1,5 +1,6 @@
 use std::{
     io,
+    ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -7,6 +8,7 @@ use std::{
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::oneshot,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -17,6 +19,8 @@ pub enum FetcherError {
     InvalidChunkOffset,
     #[error("chunk size out of range")]
     InvalidChunkSize,
+    #[error("file handler is dead")]
+    FileHandlerClosed,
     #[error("error while operating on file '{path}': {source}")]
     IoError {
         path: PathBuf,
@@ -62,13 +66,67 @@ impl Chunk {
 }
 
 #[derive(Debug)]
+enum Operation {
+    Read {
+        offset: u64,
+        length: u64,
+        chunk_sender: oneshot::Sender<Vec<u8>>,
+    },
+    Write {
+        offset: u64,
+        data: Vec<u8>,
+    },
+}
+
+fn spawn_file_handler(mut handler: fs::File, operations_receiver: flume::Receiver<Operation>) {
+    tokio::spawn(async move {
+        loop {
+            let op = match operations_receiver.recv_async().await {
+                Ok(op) => op,
+                Err(flume::RecvError::Disconnected) => break,
+            };
+
+            let offset = match op {
+                Operation::Read { offset, .. } => offset,
+                Operation::Write { offset, .. } => offset,
+            };
+            if handler.seek(io::SeekFrom::Start(offset)).await.is_err() {
+                return;
+            }
+
+            match op {
+                Operation::Read {
+                    length,
+                    chunk_sender,
+                    ..
+                } => {
+                    let mut buff = vec![0; length as usize];
+                    if handler.read_exact(&mut buff).await.is_err() {
+                        return;
+                    }
+
+                    let _ = chunk_sender.send(buff);
+                }
+                Operation::Write { data, .. } => {
+                    if handler.write_all(&data).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let _ = handler.flush().await;
+    });
+}
+
+#[derive(Debug)]
 pub struct FileHandler {
-    handler: fs::File,
+    operations_sender: flume::Sender<Operation>,
 }
 
 impl FileHandler {
-    fn new(handler: fs::File) -> Self {
-        Self { handler }
+    fn new(operations_sender: flume::Sender<Operation>) -> Self {
+        Self { operations_sender }
     }
 
     async fn create(path: impl AsRef<Path>, file_size: u64) -> io::Result<Self> {
@@ -88,83 +146,45 @@ impl FileHandler {
 
         handler.set_len(file_size).await?;
 
-        let fetcher = Self::new(handler);
+        let (operations_sender, operations_receiver) = flume::unbounded();
+
+        spawn_file_handler(handler, operations_receiver);
+
+        let fetcher = Self::new(operations_sender);
 
         Ok(fetcher)
     }
 
-    async fn seek(&mut self, offset: u64) -> io::Result<()> {
-        let pos = io::SeekFrom::Start(offset);
+    async fn read_chunk(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        let (chunk_sender, chunk_receiver) = oneshot::channel();
 
-        self.handler.seek(pos).await?;
+        let op = Operation::Read {
+            offset,
+            length,
+            chunk_sender,
+        };
+        self.operations_sender.send_async(op).await.ok()?;
 
-        Ok(())
+        chunk_receiver.await.ok()
     }
 
-    async fn read_chunk(&mut self, offset: u64, length: u64) -> io::Result<Vec<u8>> {
-        self.seek(offset).await?;
-
-        let mut buff = vec![0; length as usize];
-        self.handler.read_exact(&mut buff).await?;
-
-        Ok(buff)
-    }
-
-    async fn write_block(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.seek(offset).await?;
-
-        self.handler.write_all(data).await?;
-
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> io::Result<()> {
-        self.handler.flush().await
+    async fn write_block(&self, offset: u64, data: Vec<u8>) -> bool {
+        let op = Operation::Write { offset, data };
+        self.operations_sender.send_async(op).await.is_ok()
     }
 }
 
 #[derive(Debug)]
-struct FetcherInner {
-    handler: tokio::sync::Mutex<FileHandler>,
-    path: PathBuf,
+pub struct FetcherInner {
+    handler: FileHandler,
     file_size: u64,
     block_size: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct Fetcher(Arc<FetcherInner>);
-
-impl Fetcher {
-    pub async fn create(
-        path: impl AsRef<Path>,
-        file_size: u64,
-        block_size: u64,
-    ) -> Result<Self, FetcherError> {
-        let handler = tokio::sync::Mutex::new(
-            FileHandler::create(&path, file_size)
-                .await
-                .map_err(|e| FetcherError::io_error(&path, e))?,
-        );
-
-        let path = path.as_ref().into();
-
-        let inner = Arc::new(FetcherInner {
-            handler,
-            path,
-            file_size,
-            block_size,
-        });
-
-        Ok(Self(inner))
-    }
-
-    fn to_io_error(&self, source: io::Error) -> FetcherError {
-        FetcherError::io_error(self.0.path.as_path(), source)
-    }
-
+impl FetcherInner {
     fn block_offset(&self, index: u64) -> Result<u64, FetcherError> {
-        let (offset, overflow) = index.overflowing_mul(self.0.block_size);
-        if overflow || offset >= self.0.file_size {
+        let (offset, overflow) = index.overflowing_mul(self.block_size);
+        if overflow || offset >= self.file_size {
             return Err(FetcherError::InvalidBlockOffset);
         }
 
@@ -175,7 +195,7 @@ impl Fetcher {
         let block_offset = self.block_offset(index)?;
 
         let (offset, overflow) = block_offset.overflowing_add(begin);
-        if overflow || offset >= self.0.file_size {
+        if overflow || offset >= self.file_size {
             return Err(FetcherError::InvalidChunkOffset);
         }
 
@@ -186,39 +206,57 @@ impl Fetcher {
         let offset = self.chunk_offset(chunk.index, chunk.begin)?;
 
         let (end, overflow) = offset.overflowing_add(chunk.length);
-        if overflow || end > self.0.file_size {
+        if overflow || end > self.file_size {
             return Err(FetcherError::InvalidChunkSize);
         }
 
-        self.0
-            .handler
-            .lock()
-            .await
+        self.handler
             .read_chunk(offset, chunk.length)
             .await
-            .map_err(|e| self.to_io_error(e))
+            .ok_or(FetcherError::FileHandlerClosed)
     }
 
     pub async fn write_block(&self, block: Block) -> Result<(), FetcherError> {
         let offset = self.block_offset(block.index)?;
 
-        self.0
-            .handler
-            .lock()
+        self.handler
+            .write_block(offset, block.data)
             .await
-            .write_block(offset, &block.data)
-            .await
-            .map_err(|e| self.to_io_error(e))
+            .then_some(())
+            .ok_or(FetcherError::FileHandlerClosed)
     }
+}
 
-    pub async fn flush(&self) -> Result<(), FetcherError> {
-        self.0
-            .handler
-            .lock()
+#[derive(Debug, Clone)]
+pub struct Fetcher {
+    inner: Arc<FetcherInner>,
+}
+
+impl Fetcher {
+    pub async fn create(
+        path: impl AsRef<Path>,
+        file_size: u64,
+        block_size: u64,
+    ) -> Result<Self, FetcherError> {
+        let handler = FileHandler::create(&path, file_size)
             .await
-            .flush()
-            .await
-            .map_err(|e| self.to_io_error(e))
+            .map_err(|e| FetcherError::io_error(&path, e))?;
+
+        let inner = Arc::new(FetcherInner {
+            handler,
+            file_size,
+            block_size,
+        });
+
+        Ok(Self { inner })
+    }
+}
+
+impl Deref for Fetcher {
+    type Target = FetcherInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
