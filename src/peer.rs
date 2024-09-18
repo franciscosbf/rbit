@@ -636,7 +636,7 @@ impl Deref for PeerState {
 }
 
 #[trait_variant::make(Send + Sync)]
-pub trait Events: 'static {
+pub trait PeerEvents: 'static {
     async fn on_choke(&self, _peer: PeerClient) {
         async {}
     }
@@ -783,7 +783,7 @@ impl Future for ReceiverTolerance {
 
 async fn close_connection_and_call_its_event<E>(client: PeerClient, events: Arc<E>)
 where
-    E: Events,
+    E: PeerEvents,
 {
     if !client.close() {
         return;
@@ -800,7 +800,7 @@ fn spawn_heartbeat<E>(
     reset_signal: Arc<Notify>,
     events: Arc<E>,
 ) where
-    E: Events,
+    E: PeerEvents,
 {
     tokio::spawn(async move {
         loop {
@@ -828,7 +828,7 @@ fn spawn_receiver<E>(
     events: Arc<E>,
 ) -> tokio::task::JoinHandle<()>
 where
-    E: Events,
+    E: PeerEvents,
 {
     tokio::spawn(async move {
         let keep_tolerating = ReceiverTolerance::new();
@@ -1012,7 +1012,7 @@ impl PeerClient {
         events: Arc<E>,
     ) -> Result<Self, PeerError>
     where
-        E: Events,
+        E: PeerEvents,
     {
         if !accepted_handshake(handshake, &mut stream).await {
             let socket = stream.peer_addr().unwrap();
@@ -1084,9 +1084,9 @@ mod tests {
 
     use super::{
         accepted_handshake, bitfield_chunks, spawn_receiver, stopper, BitfieldIndex,
-        CanceledPieceBlock, Events, Handshake, Message, PeerBitfield, PeerClient, PeerClientInner,
-        PeerError, PeerId, PeerState, PieceBlockRequest, ReceivedPieceBlock, StopperActor,
-        StreamRead, StreamReader, StreamWriter, Switch,
+        CanceledPieceBlock, Handshake, Message, PeerBitfield, PeerClient, PeerClientInner,
+        PeerError, PeerEvents, PeerId, PeerState, PieceBlockRequest, ReceivedPieceBlock,
+        StopperActor, StreamRead, StreamReader, StreamWriter, Switch,
     };
 
     struct LocalListenerInner {
@@ -1233,7 +1233,7 @@ mod tests {
     async fn validate_spawn_receiver_with_8_pieces_and_69_of_buff_size<CF, PF>(
         client_checker: CF,
         peer_action: PF,
-        events: impl Events + 'static,
+        events: impl PeerEvents + 'static,
     ) where
         CF: FnOnce(PeerState, PeerBitfield) -> BoxFuture<'static, ()> + Send + 'static,
         PF: FnOnce(tokio::net::tcp::OwnedWriteHalf) -> BoxFuture<'static, ()> + Send + 'static,
@@ -1320,7 +1320,7 @@ mod tests {
 
         struct EventsMock;
 
-        impl Events for EventsMock {}
+        impl PeerEvents for EventsMock {}
 
         let senders = Arc::new(EventsMock);
         let stream = listener.self_connect().await;
@@ -2027,7 +2027,7 @@ mod tests {
             sender: mpsc::Sender<()>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_unchoke(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
@@ -2061,7 +2061,7 @@ mod tests {
             sender: mpsc::Sender<()>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_choke(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
@@ -2096,7 +2096,7 @@ mod tests {
             sender: mpsc::Sender<()>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_interest(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
@@ -2130,7 +2130,7 @@ mod tests {
             sender: mpsc::Sender<()>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_not_interest(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
@@ -2161,7 +2161,7 @@ mod tests {
     async fn receiver_gets_have_msg() {
         struct EventsMock;
 
-        impl Events for EventsMock {}
+        impl PeerEvents for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, bitfield| {
@@ -2189,7 +2189,7 @@ mod tests {
     async fn receiver_gets_bitfield_msg() {
         struct EventsMock;
 
-        impl Events for EventsMock {}
+        impl PeerEvents for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |_, bitfield| {
@@ -2218,7 +2218,7 @@ mod tests {
             sender: mpsc::Sender<()>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_implicit_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
@@ -2254,7 +2254,7 @@ mod tests {
             sender: mpsc::Sender<PieceBlockRequest>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_piece_block_request(&self, piece_block: PieceBlockRequest) {
                 let _ = self.sender.send(piece_block).await;
             }
@@ -2297,7 +2297,7 @@ mod tests {
             sender: mpsc::Sender<ReceivedPieceBlock>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_received_piece_block(&self, piece_block: ReceivedPieceBlock) {
                 let _ = self.sender.send(piece_block).await;
             }
@@ -2340,7 +2340,7 @@ mod tests {
             sender: mpsc::Sender<CanceledPieceBlock>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_canceled_piece_block(&self, piece_block: CanceledPieceBlock) {
                 let _ = self.sender.send(piece_block).await;
             }
@@ -2379,7 +2379,7 @@ mod tests {
     async fn receiver_gets_unchoke_and_keep_alive_msgs() {
         struct EventsMock;
 
-        impl Events for EventsMock {}
+        impl PeerEvents for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _| {
@@ -2409,7 +2409,7 @@ mod tests {
             sender: mpsc::Sender<()>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_implicit_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
@@ -2451,7 +2451,7 @@ mod tests {
             sender: mpsc::Sender<()>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_implicit_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
@@ -2479,7 +2479,7 @@ mod tests {
     async fn receiver_gets_unchoke_msg_after_invalid_msg() {
         struct EventsMock;
 
-        impl Events for EventsMock {}
+        impl PeerEvents for EventsMock {}
 
         validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
             |state, _| {
@@ -2509,7 +2509,7 @@ mod tests {
             sender: mpsc::Sender<()>,
         }
 
-        impl Events for EventsMock {
+        impl PeerEvents for EventsMock {
             async fn on_implicit_close(&self, _peer: PeerClient) {
                 let _ = self.sender.send(()).await;
             }
