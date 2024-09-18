@@ -522,5 +522,7 @@ mod tests {
 
         assert_matches!(error, FetcherError::IoError(e)
             if e.kind() == io::ErrorKind::UnexpectedEof);
+
+        assert!(operations_sender.is_disconnected());
     }
 }
