@@ -1,9 +1,4 @@
-use std::{
-    io,
-    ops::Deref,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{io, ops::Deref, path::Path, sync::Arc};
 
 use tokio::{
     fs,
@@ -20,21 +15,9 @@ pub enum FetcherError {
     #[error("chunk size out of range")]
     InvalidChunkSize,
     #[error("file handler is dead")]
-    FileHandlerClosed,
-    #[error("error while operating on file '{path}': {source}")]
-    IoError {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-}
-
-impl FetcherError {
-    fn io_error(path: impl AsRef<Path>, source: io::Error) -> Self {
-        let path = path.as_ref().into();
-
-        Self::IoError { path, source }
-    }
+    FileHandlerStopped,
+    #[error("error while operating on file: {0}")]
+    IoError(#[source] io::Error),
 }
 
 #[derive(Debug)]
@@ -73,13 +56,33 @@ enum Operation {
         chunk_sender: oneshot::Sender<Vec<u8>>,
     },
     Write {
+        index: u64,
         offset: u64,
         data: Vec<u8>,
     },
 }
 
-fn spawn_file_handler(mut handler: fs::File, operations_receiver: flume::Receiver<Operation>) {
+#[trait_variant::make(Send + Sync)]
+pub trait FetcherEvents: 'static {
+    async fn on_write(&self, _index: u64) {
+        async {}
+    }
+
+    async fn on_write_error(&self, _error: FetcherError) {
+        async {}
+    }
+}
+
+fn spawn_file_handler<E>(
+    mut handler: fs::File,
+    operations_receiver: flume::Receiver<Operation>,
+    events: Arc<E>,
+) where
+    E: FetcherEvents,
+{
     tokio::spawn(async move {
+        let fire_io_error = |e: io::Error| events.on_write_error(FetcherError::IoError(e));
+
         loop {
             let op = match operations_receiver.recv_async().await {
                 Ok(op) => op,
@@ -90,7 +93,9 @@ fn spawn_file_handler(mut handler: fs::File, operations_receiver: flume::Receive
                 Operation::Read { offset, .. } => offset,
                 Operation::Write { offset, .. } => offset,
             };
-            if handler.seek(io::SeekFrom::Start(offset)).await.is_err() {
+            if let Err(e) = handler.seek(io::SeekFrom::Start(offset)).await {
+                fire_io_error(e).await;
+
                 return;
             }
 
@@ -101,21 +106,29 @@ fn spawn_file_handler(mut handler: fs::File, operations_receiver: flume::Receive
                     ..
                 } => {
                     let mut buff = vec![0; length as usize];
-                    if handler.read_exact(&mut buff).await.is_err() {
+                    if let Err(e) = handler.read_exact(&mut buff).await {
+                        fire_io_error(e).await;
+
                         return;
                     }
 
                     let _ = chunk_sender.send(buff);
                 }
-                Operation::Write { data, .. } => {
-                    if handler.write_all(&data).await.is_err() {
+                Operation::Write { index, data, .. } => {
+                    if let Err(e) = handler.write_all(&data).await {
+                        fire_io_error(e).await;
+
                         return;
                     }
+
+                    events.on_write(index).await;
                 }
             }
         }
 
-        let _ = handler.flush().await;
+        if let Err(e) = handler.flush().await {
+            fire_io_error(e).await;
+        }
     });
 }
 
@@ -129,14 +142,17 @@ impl FileHandler {
         Self { operations_sender }
     }
 
-    async fn create(path: impl AsRef<Path>, file_size: u64) -> io::Result<Self> {
+    async fn create<E>(path: impl AsRef<Path>, file_size: u64, events: Arc<E>) -> io::Result<Self>
+    where
+        E: FetcherEvents,
+    {
         let parent = path.as_ref().parent().ok_or(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid file path",
         ))?;
         fs::create_dir_all(parent).await?;
 
-        let handler = fs::OpenOptions::new()
+        let handler = fs::File::options()
             .read(true)
             .write(true)
             .truncate(true)
@@ -148,7 +164,7 @@ impl FileHandler {
 
         let (operations_sender, operations_receiver) = flume::unbounded();
 
-        spawn_file_handler(handler, operations_receiver);
+        spawn_file_handler(handler, operations_receiver, events);
 
         let fetcher = Self::new(operations_sender);
 
@@ -168,8 +184,12 @@ impl FileHandler {
         chunk_receiver.await.ok()
     }
 
-    async fn write_block(&self, offset: u64, data: Vec<u8>) -> bool {
-        let op = Operation::Write { offset, data };
+    async fn request_write_block(&self, index: u64, offset: u64, data: Vec<u8>) -> bool {
+        let op = Operation::Write {
+            index,
+            offset,
+            data,
+        };
         self.operations_sender.send_async(op).await.is_ok()
     }
 }
@@ -213,17 +233,17 @@ impl FetcherInner {
         self.handler
             .read_chunk(offset, chunk.length)
             .await
-            .ok_or(FetcherError::FileHandlerClosed)
+            .ok_or(FetcherError::FileHandlerStopped)
     }
 
-    pub async fn write_block(&self, block: Block) -> Result<(), FetcherError> {
+    pub async fn request_block_write(&self, block: Block) -> Result<(), FetcherError> {
         let offset = self.block_offset(block.index)?;
 
         self.handler
-            .write_block(offset, block.data)
+            .request_write_block(block.index, offset, block.data)
             .await
             .then_some(())
-            .ok_or(FetcherError::FileHandlerClosed)
+            .ok_or(FetcherError::FileHandlerStopped)
     }
 }
 
@@ -233,14 +253,18 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
-    pub async fn create(
+    pub async fn create<E>(
         path: impl AsRef<Path>,
         file_size: u64,
         block_size: u64,
-    ) -> Result<Self, FetcherError> {
-        let handler = FileHandler::create(&path, file_size)
+        events: Arc<E>,
+    ) -> Result<Self, FetcherError>
+    where
+        E: FetcherEvents,
+    {
+        let handler = FileHandler::create(&path, file_size, events)
             .await
-            .map_err(|e| FetcherError::io_error(&path, e))?;
+            .map_err(FetcherError::IoError)?;
 
         let inner = Arc::new(FetcherInner {
             handler,
@@ -262,29 +286,54 @@ impl Deref for Fetcher {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, os::unix::fs::MetadataExt, path::Path};
+    use core::panic;
+    use std::{env, io, os::unix::fs::MetadataExt, path::Path, sync::Arc, time::Duration};
 
     use claims::{assert_err, assert_matches, assert_ok};
+    use tokio::sync::oneshot;
 
-    use super::{Block, Chunk, Fetcher, FetcherError};
+    use super::{
+        spawn_file_handler, Block, Chunk, Fetcher, FetcherError, FetcherEvents, Operation,
+    };
 
     fn gen_random_filename() -> String {
         format!("inner/bytes_file_{}.txt", rand::random::<u64>())
     }
 
-    async fn create_random_file() -> Fetcher {
+    async fn create_fetcher<E>(events: Arc<E>) -> Fetcher
+    where
+        E: FetcherEvents,
+    {
         let path = env::temp_dir().join(gen_random_filename());
 
-        Fetcher::create(&path, 64, 32)
+        Fetcher::create(&path, 64, 32, events)
+            .await
+            .expect("Failed to create file fetcher")
+    }
+
+    async fn create_fetcher_without_event_handlers() -> Fetcher {
+        struct EventsMock;
+        impl FetcherEvents for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
+        let path = env::temp_dir().join(gen_random_filename());
+
+        Fetcher::create(&path, 64, 32, events)
             .await
             .expect("Failed to create file fetcher")
     }
 
     #[tokio::test]
     async fn creates_a_file() {
+        struct EventsMock;
+        impl FetcherEvents for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
         let path = env::temp_dir().join(gen_random_filename());
 
-        assert_ok!(Fetcher::create(&path, 64, 32).await);
+        assert_ok!(Fetcher::create(&path, 64, 32, events).await);
 
         let meta = tokio::fs::File::open(&path)
             .await
@@ -298,21 +347,57 @@ mod tests {
 
     #[tokio::test]
     async fn fails_to_create_a_file_with_invalid_file_path() {
+        struct EventsMock;
+        impl FetcherEvents for EventsMock {}
+
         let invalid_paths = vec![Path::new("/"), Path::new("")];
 
         for invalid_path in invalid_paths {
-            let err = assert_err!(Fetcher::create(&invalid_path, 64, 32).await);
-            assert_matches!(err, FetcherError::IoError { path, source }
-                if path == invalid_path && source.kind() == std::io::ErrorKind::InvalidInput);
+            let events = Arc::new(EventsMock);
+
+            let err = assert_err!(Fetcher::create(&invalid_path, 64, 32, events).await);
+            assert_matches!(err, FetcherError::IoError(e)
+                if e.kind() == std::io::ErrorKind::InvalidInput);
         }
     }
 
     #[tokio::test]
     async fn write_blocks_and_read_chunks() {
-        let fetcher = create_random_file().await;
+        struct EventsMock {
+            index_sender: flume::Sender<u64>,
+        }
+        impl FetcherEvents for EventsMock {
+            async fn on_write(&self, index: u64) {
+                let _ = self.index_sender.send_async(index).await;
+            }
+
+            async fn on_write_error(&self, error: FetcherError) {
+                dbg!(error);
+            }
+        }
+
+        let (index_sender, index_receiver) = flume::unbounded();
+        let events = Arc::new(EventsMock { index_sender });
+
+        async fn recv_index_write_confirmation(
+            index_receiver: &flume::Receiver<u64>,
+            expected_index: u64,
+        ) {
+            let index = tokio::time::timeout(Duration::from_secs(4), index_receiver.recv_async())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("Didn't receive write confirmation from block index {expected_index}")
+                })
+                .unwrap();
+
+            assert_eq!(index, expected_index);
+        }
+
+        let fetcher = create_fetcher(events).await;
 
         let block = Block::new(0, vec![1; 32]);
-        assert_ok!(fetcher.write_block(block).await);
+        assert_ok!(fetcher.request_block_write(block).await);
+        recv_index_write_confirmation(&index_receiver, 0).await;
 
         let chunk = Chunk::new(0, 0, 32);
         let data = assert_ok!(fetcher.read_chunk(chunk).await);
@@ -323,7 +408,8 @@ mod tests {
         assert!(data.iter().all(|&b| b == 0));
 
         let block = Block::new(1, vec![2; 32]);
-        assert_ok!(fetcher.write_block(block).await);
+        assert_ok!(fetcher.request_block_write(block).await);
+        recv_index_write_confirmation(&index_receiver, 1).await;
 
         let chunk = Chunk::new(1, 0, 32);
         let data = assert_ok!(fetcher.read_chunk(chunk).await);
@@ -332,7 +418,8 @@ mod tests {
         let mut data = vec![3; 16];
         data.append(&mut vec![4; 16]);
         let block = Block::new(0, data);
-        assert_ok!(fetcher.write_block(block).await);
+        assert_ok!(fetcher.request_block_write(block).await);
+        recv_index_write_confirmation(&index_receiver, 0).await;
 
         let chunk = Chunk::new(0, 8, 16);
         let data = assert_ok!(fetcher.read_chunk(chunk).await);
@@ -342,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_to_read_with_invalid_block_offset() {
-        let fetcher = create_random_file().await;
+        let fetcher = create_fetcher_without_event_handlers().await;
 
         let invalid_chunks = vec![Chunk::new(u64::MAX, 0, 32), Chunk::new(2, 0, 32)];
 
@@ -354,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_to_write_with_invalid_block_offset() {
-        let fetcher = create_random_file().await;
+        let fetcher = create_fetcher_without_event_handlers().await;
 
         let invalid_blocks = vec![
             Block::new(u64::MAX, vec![1; 32]),
@@ -362,14 +449,14 @@ mod tests {
         ];
 
         for invalid_block in invalid_blocks {
-            let err = assert_err!(fetcher.write_block(invalid_block).await);
+            let err = assert_err!(fetcher.request_block_write(invalid_block).await);
             assert_matches!(err, FetcherError::InvalidBlockOffset);
         }
     }
 
     #[tokio::test]
     async fn fail_to_read_with_invalid_chunk_offset() {
-        let fetcher = create_random_file().await;
+        let fetcher = create_fetcher_without_event_handlers().await;
 
         let invalid_chunks = vec![Chunk::new(1, u64::MAX, 32), Chunk::new(1, 64, 32)];
 
@@ -381,7 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_to_read_when_chunk_exceeds_limits() {
-        let fetcher = create_random_file().await;
+        let fetcher = create_fetcher_without_event_handlers().await;
 
         let invalid_chunks = vec![Chunk::new(1, 0, u64::MAX), Chunk::new(1, 0, 65)];
 
@@ -389,5 +476,51 @@ mod tests {
             let err = assert_err!(fetcher.read_chunk(invalid_chunk).await);
             assert_matches!(err, FetcherError::InvalidChunkSize);
         }
+    }
+
+    #[tokio::test]
+    async fn file_handler_stops_on_io_error() {
+        let path = env::temp_dir().join(gen_random_filename());
+        let handler = tokio::fs::File::options()
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(path)
+            .await
+            .expect("Failed to create file");
+
+        struct EventsMock {
+            error_sender: flume::Sender<FetcherError>,
+        }
+        impl FetcherEvents for EventsMock {
+            async fn on_write_error(&self, error: FetcherError) {
+                let _ = self.error_sender.send_async(error).await;
+            }
+        }
+
+        let (error_sender, error_receiver) = flume::unbounded();
+        let events = Arc::new(EventsMock { error_sender });
+
+        let (operations_sender, operations_receiver) = flume::unbounded();
+
+        spawn_file_handler(handler, operations_receiver, events);
+
+        let (chunk_sender, _) = oneshot::channel();
+        let _ = operations_sender
+            .send_async(Operation::Read {
+                offset: 0,
+                length: 32,
+                chunk_sender,
+            })
+            .await;
+
+        let error = tokio::time::timeout(Duration::from_secs(4), error_receiver.recv_async())
+            .await
+            .unwrap_or_else(|_| panic!("Didn't receive any error"))
+            .unwrap();
+
+        assert_matches!(error, FetcherError::IoError(e)
+            if e.kind() == io::ErrorKind::UnexpectedEof);
     }
 }
