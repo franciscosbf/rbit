@@ -90,7 +90,7 @@ fn spawn_file_handler<E>(
     E: FetcherEvents,
 {
     tokio::spawn(async move {
-        let fire_io_error = |e: io::Error| events.on_write_error(FetcherError::IoError(e));
+        let fire_event_error = |e: io::Error| events.on_write_error(FetcherError::IoError(e));
 
         loop {
             let op = match operations_receiver.recv_async().await {
@@ -105,7 +105,7 @@ fn spawn_file_handler<E>(
                 _ => unreachable!(),
             };
             if let Err(e) = handler.seek(io::SeekFrom::Start(offset)).await {
-                fire_io_error(e).await;
+                fire_event_error(e).await;
 
                 return;
             }
@@ -118,7 +118,7 @@ fn spawn_file_handler<E>(
                 } => {
                     let mut buff = vec![0; length as usize];
                     if let Err(e) = handler.read_exact(&mut buff).await {
-                        fire_io_error(e).await;
+                        fire_event_error(e).await;
 
                         return;
                     }
@@ -127,7 +127,7 @@ fn spawn_file_handler<E>(
                 }
                 Operation::Write { index, data, .. } => {
                     if let Err(e) = handler.write_all(&data).await {
-                        fire_io_error(e).await;
+                        fire_event_error(e).await;
 
                         return;
                     }
@@ -139,7 +139,7 @@ fn spawn_file_handler<E>(
         }
 
         if let Err(e) = handler.flush().await {
-            fire_io_error(e).await;
+            fire_event_error(e).await;
         }
     });
 }
