@@ -1,4 +1,12 @@
-use std::{io, ops::Deref, path::Path, sync::Arc};
+use std::{
+    io,
+    ops::Deref,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use tokio::{
     fs,
@@ -139,11 +147,17 @@ fn spawn_file_handler<E>(
 #[derive(Debug)]
 pub struct FileHandler {
     operations_sender: flume::Sender<Operation>,
+    stopped: AtomicBool,
 }
 
 impl FileHandler {
     fn new(operations_sender: flume::Sender<Operation>) -> Self {
-        Self { operations_sender }
+        let stopped = AtomicBool::new(false);
+
+        Self {
+            operations_sender,
+            stopped,
+        }
     }
 
     async fn create<E>(path: impl AsRef<Path>, file_size: u64, events: Arc<E>) -> io::Result<Self>
@@ -175,11 +189,26 @@ impl FileHandler {
         Ok(fetcher)
     }
 
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
     async fn send_op(&self, op: Operation) -> Result<(), flume::SendError<Operation>> {
-        self.operations_sender.send_async(op).await
+        self.operations_sender
+            .send_async(op)
+            .await
+            .inspect_err(|_| self.stop())
     }
 
     async fn read_chunk(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        if self.is_stopped() {
+            return None;
+        }
+
         let (chunk_sender, chunk_receiver) = oneshot::channel();
 
         let op = Operation::Read {
@@ -189,10 +218,14 @@ impl FileHandler {
         };
         self.send_op(op).await.ok()?;
 
-        chunk_receiver.await.ok()
+        chunk_receiver.await.inspect_err(|_| self.stop()).ok()
     }
 
     async fn request_write_block(&self, index: u64, offset: u64, data: Vec<u8>) -> bool {
+        if self.is_stopped() {
+            return false;
+        }
+
         let op = Operation::Write {
             index,
             offset,
@@ -202,6 +235,12 @@ impl FileHandler {
     }
 
     async fn request_stop(&self) -> bool {
+        if self.is_stopped() {
+            return false;
+        }
+
+        self.stop();
+
         self.send_op(Operation::Stop).await.is_ok()
     }
 }
@@ -260,6 +299,10 @@ impl FetcherInner {
 
     pub async fn request_stop(&self) -> bool {
         self.handler.request_stop().await
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.handler.is_stopped()
     }
 }
 
@@ -333,11 +376,7 @@ mod tests {
 
         let events = Arc::new(EventsMock);
 
-        let path = env::temp_dir().join(gen_random_filename());
-
-        Fetcher::create(&path, 64, 32, events)
-            .await
-            .expect("Failed to create file fetcher")
+        create_fetcher(events).await
     }
 
     #[tokio::test]
@@ -543,12 +582,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetcher_stops_on_file_handler_error() {
+        struct EventsMock;
+        impl FetcherEvents for EventsMock {}
+
+        let events = Arc::new(EventsMock);
+
+        let path = env::temp_dir().join(gen_random_filename());
+
+        let fetcher = Fetcher::create(&path, 64, 32, events)
+            .await
+            .expect("Failed to create file fetcher");
+
+        {
+            tokio::fs::File::options()
+                .write(true)
+                .open(&path)
+                .await
+                .expect("Failed to open second file handler")
+                .set_len(32)
+                .await
+                .expect("Failed to redefine file size");
+        }
+
+        let chunk = Chunk::new(1, 0, 32);
+        assert_matches!(
+            fetcher.read_chunk(chunk).await,
+            Err(FetcherError::FileHandlerStopped)
+        );
+
+        assert!(fetcher.is_stopped());
+
+        let block = Block::new(1, vec![2; 32]);
+        assert_matches!(
+            fetcher.request_block_write(block).await,
+            Err(FetcherError::FileHandlerStopped)
+        );
+
+        assert!(!fetcher.request_stop().await);
+    }
+
+    #[tokio::test]
     async fn fail_to_read_and_write_when_file_handler_is_stopped() {
         let fetcher = create_fetcher_without_event_handlers().await;
 
         assert!(fetcher.request_stop().await);
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
         let chunk = Chunk::new(1, 0, 32);
         assert_matches!(
