@@ -9,6 +9,24 @@ use sha1::{Digest, Sha1};
 use thiserror::Error;
 use url::Url;
 
+const MAX_PIECE_SIZE: u64 = 524288;
+
+fn acceptable_piece_size(size_in_bytes: u64) -> bool {
+    (1..=MAX_PIECE_SIZE).contains(&size_in_bytes)
+}
+
+const MAX_FILE_SIZE_IN_BYTES: u64 = 4294967296;
+
+fn acceptable_file_size(size_in_bytes: u64) -> bool {
+    (1..=MAX_FILE_SIZE_IN_BYTES).contains(&size_in_bytes)
+}
+
+const MAX_MULTI_FILE_TOTAL_SIZE_IN_BYTES: u64 = MAX_FILE_SIZE_IN_BYTES * 4;
+
+fn acceptable_multi_file_total_size(size_in_bytes: u64) -> bool {
+    (1..=MAX_MULTI_FILE_TOTAL_SIZE_IN_BYTES).contains(&size_in_bytes)
+}
+
 #[derive(Error, Debug)]
 pub enum TorrentError {
     #[error("invalid file")]
@@ -251,17 +269,28 @@ impl Deref for InfoHash {
 #[derive(Debug)]
 pub struct FileMeta {
     pub length: u64,
-    pub start: u64,
-    pub end: u64,
+    pub first_piece: u64,
+    pub first_piece_start: u64,
+    pub last_piece: u64,
+    pub last_piece_end: u64,
     pub path: PathBuf,
 }
 
 impl FileMeta {
-    fn new(length: u64, start: u64, end: u64, path: PathBuf) -> Self {
+    fn new(
+        length: u64,
+        first_piece: u64,
+        first_piece_start: u64,
+        last_piece: u64,
+        last_piece_end: u64,
+        path: PathBuf,
+    ) -> Self {
         Self {
             length,
-            start,
-            end,
+            first_piece,
+            first_piece_start,
+            last_piece,
+            last_piece_end,
             path,
         }
     }
@@ -276,9 +305,9 @@ pub enum FileType {
 #[derive(Debug)]
 pub struct Torrent {
     pub tracker: Url,
-    pub piece_size: u64,
+    pub piece_length: u64,
     pub hash_pieces: HashPieces,
-    pub length: u64,
+    pub total_length: u64,
     pub file_type: FileType,
     pub info_hash: InfoHash,
 }
@@ -286,17 +315,17 @@ pub struct Torrent {
 impl Torrent {
     fn new(
         tracker: Url,
-        piece: u64,
+        piece_length: u64,
         hash_pieces: HashPieces,
-        length: u64,
+        total_length: u64,
         file_type: FileType,
         info_hash: InfoHash,
     ) -> Self {
         Self {
             tracker,
-            piece_size: piece,
+            piece_length,
             hash_pieces,
-            length,
+            total_length,
             file_type,
             info_hash,
         }
@@ -328,38 +357,33 @@ impl TryFrom<MetaInfo> for Torrent {
             return Err(TorrentError::InvalidFieldValue("info.name"));
         }
 
-        let piece = if info.piece_length > 0 {
-            info.piece_length
-        } else {
+        if !acceptable_piece_size(info.piece_length) {
             return Err(TorrentError::InvalidFieldValue("info.piece"));
-        };
+        }
+
+        let piece_length = info.piece_length;
 
         let hash_pieces = HashPieces::try_from(info.pieces)?;
 
         let (file_type, length) = match (info.length, info.files) {
             (Some(length), None) => {
-                let length = if length > 0 {
-                    length
-                } else {
+                if !acceptable_file_size(length) {
                     return Err(TorrentError::InvalidFieldValue("info.length"));
-                };
+                }
+
                 let name = raw_name.to_string();
 
                 (FileType::Single { name }, length)
             }
             (None, Some(files)) => {
                 let dir = name;
-                let mut current = 0;
                 let mut total_length = 0;
                 let files = files
                     .into_iter()
                     .map(|f| {
-                        let length = if f.length > 0 {
-                            total_length += f.length;
-                            f.length
-                        } else {
+                        if !acceptable_file_size(f.length) {
                             return Err(TorrentError::InvalidFieldValue("info.files.length"));
-                        };
+                        }
 
                         if f.path.is_empty() {
                             return Err(TorrentError::InvalidFieldValue("info.files.path"));
@@ -367,19 +391,56 @@ impl TryFrom<MetaInfo> for Torrent {
 
                         let path = f.path.iter().collect::<PathBuf>();
 
-                        let start = current;
-                        let shift = start + (length + piece - 1) / piece;
-                        let end = shift - 1;
-                        if shift as usize > hash_pieces.len() {
+                        if !path.starts_with(raw_name) {
+                            return Err(TorrentError::InvalidFieldValue("info.files.path"));
+                        }
+
+                        let file_length = f.length;
+                        let prev_total_length = total_length;
+                        total_length += file_length;
+
+                        if !acceptable_multi_file_total_size(total_length) {
+                            return Err(TorrentError::InvalidFieldValue("info.files.length"));
+                        }
+
+                        let first_piece = prev_total_length / piece_length;
+                        let last_piece = (total_length - 1) / piece_length;
+
+                        if last_piece as usize >= hash_pieces.len() {
                             return Err(TorrentError::InvalidFieldValue("info.pieces"));
                         }
-                        current = shift;
 
-                        if path.starts_with(raw_name) {
-                            Ok(FileMeta::new(length, start, end, path))
-                        } else {
-                            Err(TorrentError::InvalidFieldValue("info.files.path"))
-                        }
+                        let first_piece_chunk = (first_piece + 1) * piece_length;
+                        let real_first_piece_start = (first_piece_chunk as i64
+                            - (first_piece_chunk as i64 - prev_total_length as i64))
+                            as u64;
+
+                        let last_piece_chunk = (last_piece + 1) * piece_length;
+                        let real_last_piece_end = (last_piece_chunk as i64
+                            - (last_piece_chunk as i64 - total_length as i64))
+                            as u64
+                            - 1;
+
+                        dbg!(real_first_piece_start, first_piece);
+                        dbg!(real_last_piece_end, last_piece);
+                        dbg!(piece_length, total_length);
+
+                        let relative_first_piece_start =
+                            real_first_piece_start - (first_piece * piece_length);
+
+                        let relative_last_piece_end =
+                            real_last_piece_end - (last_piece * piece_length);
+
+                        let file_meta = FileMeta::new(
+                            file_length,
+                            first_piece,
+                            relative_first_piece_start,
+                            last_piece,
+                            relative_last_piece_end,
+                            path,
+                        );
+
+                        Ok(file_meta)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
@@ -394,7 +455,14 @@ impl TryFrom<MetaInfo> for Torrent {
 
         let info_hash = InfoHash::hash(file.raw_info.as_slice());
 
-        let torrent = Torrent::new(tracker, piece, hash_pieces, length, file_type, info_hash);
+        let torrent = Torrent::new(
+            tracker,
+            piece_length,
+            hash_pieces,
+            length,
+            file_type,
+            info_hash,
+        );
 
         Ok(torrent)
     }
@@ -441,9 +509,9 @@ mod tests {
 
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
-        assert_eq!(torrent.piece_size, 1);
+        assert_eq!(torrent.piece_length, 1);
         assert_eq!(torrent.num_pieces(), 1);
-        assert_eq!(torrent.length, 1);
+        assert_eq!(torrent.total_length, 1);
         assert_eq!(torrent.hash_pieces.buf, b"BBBBBBBBBBBBBBBBBBBB".as_slice());
         match torrent.file_type {
             FileType::Single { name } => {
@@ -455,38 +523,42 @@ mod tests {
 
     #[test]
     fn parse_valid_torrent_with_multi_file() {
-        let raw = b"d8:announce15:http://test.com4:infod5:filesld6:lengthi6e\
-            4:pathl5:tests9:test1.txteed6:lengthi7e4:pathl5:tests9:test2.txteee\
-            4:name5:tests12:piece lengthi2e6:pieces140:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
-            AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA\
-            BBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAee";
+        let raw = b"d8:announce15:http://test.com4:infod5:filesld6:lengthi4e4:pathl5:tests9:test1.txteed6:lengthi4e4:pathl5:tests9:test2.txteed6:lengthi5e4:pathl5:tests9:test3.txteee4:name5:tests12:piece lengthi5e6:pieces60:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAee";
 
         let torrent = assert_ok!(parse(raw));
         assert_eq!(torrent.tracker, Url::parse("http://test.com").unwrap());
-        assert_eq!(torrent.piece_size, 2);
-        assert_eq!(torrent.num_pieces(), 7);
-        assert_eq!(torrent.length, 13);
+        assert_eq!(torrent.piece_length, 5);
+        assert_eq!(torrent.num_pieces(), 3);
+        assert_eq!(torrent.total_length, 13);
         assert_eq!(
             torrent.hash_pieces.buf,
-            b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
-                AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
-                AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA"
-                .as_slice()
+            b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA".as_slice()
         );
         match torrent.file_type {
             FileType::Multi { dir, files } => {
                 assert_eq!(dir, Path::new("tests"));
-                assert_eq!(files.len(), 2);
+                assert_eq!(files.len(), 3);
                 let test1 = &files[0];
-                assert_eq!(test1.length, 6);
+                assert_eq!(test1.length, 4);
                 assert_eq!(test1.path, Path::new("tests/test1.txt"));
-                assert_eq!(test1.start, 0);
-                assert_eq!(test1.end, 2);
+                assert_eq!(test1.first_piece, 0);
+                assert_eq!(test1.first_piece_start, 0);
+                assert_eq!(test1.last_piece, 0);
+                assert_eq!(test1.last_piece_end, 3);
                 let test2 = &files[1];
-                assert_eq!(test2.length, 7);
+                assert_eq!(test2.length, 4);
                 assert_eq!(test2.path, Path::new("tests/test2.txt"));
-                assert_eq!(test2.start, 3);
-                assert_eq!(test2.end, 6);
+                assert_eq!(test2.first_piece, 0);
+                assert_eq!(test2.first_piece_start, 4);
+                assert_eq!(test2.last_piece, 1);
+                assert_eq!(test2.last_piece_end, 2);
+                let test3 = &files[2];
+                assert_eq!(test3.length, 5);
+                assert_eq!(test3.path, Path::new("tests/test3.txt"));
+                assert_eq!(test3.first_piece, 1);
+                assert_eq!(test3.first_piece_start, 3);
+                assert_eq!(test3.last_piece, 2);
+                assert_eq!(test3.last_piece_end, 2);
             }
             _ => panic!("didn't match multi file"),
         }
@@ -555,6 +627,13 @@ mod tests {
             Err(TorrentError::InvalidFieldValue("info.length"))
         );
 
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi9223372036854841342e4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(
+            parse(raw),
+            Err(TorrentError::InvalidFieldValue("info.length"))
+        );
+
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi-1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
@@ -583,6 +662,14 @@ mod tests {
         );
 
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e\
+            4:name4:test12:piece lengthi9223372036854841342e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(
+            parse(raw),
+            Err(TorrentError::InvalidFieldValue("info.piece"))
+        );
+
+        let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e\
             4:name4:test12:piece lengthi-1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
@@ -602,6 +689,15 @@ mod tests {
     #[test]
     fn parse_torrent_with_multi_file_and_invalid_file_length() {
         let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi0e\
+            4:pathl5:tests5:test1eed6:lengthi1e4:pathl5:tests5:test2eee4:name5:tests\
+            12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+
+        assert_matches!(
+            parse(raw),
+            Err(TorrentError::InvalidFieldValue("info.files.length"))
+        );
+
+        let raw = b"d8:announce16:https://test.com4:infod5:filesld6:lengthi9223372036854775e\
             4:pathl5:tests5:test1eed6:lengthi1e4:pathl5:tests5:test2eee4:name5:tests\
             12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 

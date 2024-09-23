@@ -1022,7 +1022,7 @@ impl PeerClient {
         let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
 
         let reader_buff_max_size =
-            calc_reader_buff_max_size(torrent.piece_size as u32, bitfield.num_chunks());
+            calc_reader_buff_max_size(torrent.piece_length as u32, bitfield.num_chunks());
 
         let (actor, checker) = stopper();
         let state = PeerState::new(actor);
@@ -1298,9 +1298,9 @@ mod tests {
 
         let torrent: Arc<_> = Torrent {
             tracker: Url::parse("http://localhost:80").unwrap(),
-            piece_size: Message::MAX_PIECE_CHUNK_SZ as u64,
+            piece_length: Message::MAX_PIECE_CHUNK_SZ as u64,
             hash_pieces: vec![0; 20].try_into().unwrap(),
-            length: 0,
+            total_length: 0,
             file_type: FileType::Single {
                 name: "".to_string(),
             },
