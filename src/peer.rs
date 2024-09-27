@@ -1357,10 +1357,10 @@ mod tests {
 
         impl PeerEvents for EventsMock {}
 
-        let senders = Arc::new(EventsMock);
+        let events = Arc::new(EventsMock);
         let stream = listener.self_connect().await;
 
-        let pcli = PeerClient::start(handshake, stream, torrent, senders).await?;
+        let pcli = PeerClient::start(handshake, stream, torrent, events).await?;
 
         let tcli = tokio::spawn(async move {
             client_controller(pcli).await;
