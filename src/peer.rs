@@ -3,6 +3,7 @@ use futures::{future::Future, task::Poll};
 use leaky_bucket::RateLimiter;
 use running_average::RealTimeRunningAverage;
 use std::{
+    hash::Hash,
     net::SocketAddr,
     ops::Deref,
     pin::Pin,
@@ -418,7 +419,6 @@ pub struct ReceivedPieceBlock {
     pub index: u32,
     pub begin: u32,
     pub piece: Vec<u8>,
-    pub peer: PeerClient,
 }
 
 #[derive(Debug)]
@@ -426,7 +426,6 @@ pub struct PieceBlock {
     pub index: u32,
     pub begin: u32,
     pub length: u32,
-    pub peer: PeerClient,
 }
 
 pub type PieceBlockRequest = PieceBlock;
@@ -635,30 +634,31 @@ impl Deref for PeerState {
     }
 }
 
+#[allow(unused_variables)]
 #[trait_variant::make(Send + Sync)]
 pub trait PeerEvents: 'static {
-    async fn on_choke(&self, _peer: PeerClient) {
+    async fn on_choke(&self, peer: PeerClient) {
         async {}
     }
-    async fn on_unchoke(&self, _peer: PeerClient) {
+    async fn on_unchoke(&self, peer: PeerClient) {
         async {}
     }
-    async fn on_interest(&self, _peer: PeerClient) {
+    async fn on_interest(&self, peer: PeerClient) {
         async {}
     }
-    async fn on_not_interest(&self, _peer: PeerClient) {
+    async fn on_not_interest(&self, peer: PeerClient) {
         async {}
     }
-    async fn on_piece_block_request(&self, _piece_block: PieceBlockRequest) {
+    async fn on_piece_block_request(&self, peer: PeerClient, piece_block: PieceBlockRequest) {
         async {}
     }
-    async fn on_received_piece_block(&self, _piece_block: ReceivedPieceBlock) {
+    async fn on_received_piece_block(&self, peer: PeerClient, piece_block: ReceivedPieceBlock) {
         async {}
     }
-    async fn on_canceled_piece_block(&self, _piece_block: CanceledPieceBlock) {
+    async fn on_canceled_piece_block(&self, peer: PeerClient, piece_block: CanceledPieceBlock) {
         async {}
     }
-    async fn on_implicit_close(&self, _peer: PeerClient) {
+    async fn on_implicit_close(&self, peer: PeerClient) {
         async {}
     }
 }
@@ -893,12 +893,12 @@ where
                         index,
                         begin,
                         length,
-                        peer: client.clone(),
                     };
 
+                    let cpeer = client.clone();
                     let cevents = events.clone();
                     tokio::spawn(async move {
-                        cevents.on_piece_block_request(piece_block).await;
+                        cevents.on_piece_block_request(cpeer, piece_block).await;
                     });
                 }
                 Message::Piece {
@@ -912,12 +912,12 @@ where
                         index,
                         begin,
                         piece: block,
-                        peer: client.clone(),
                     };
 
+                    let cpeer = client.clone();
                     let cevents = events.clone();
                     tokio::spawn(async move {
-                        cevents.on_received_piece_block(piece_block).await;
+                        cevents.on_received_piece_block(cpeer, piece_block).await;
                     });
                 }
                 Message::Cancel {
@@ -929,12 +929,12 @@ where
                         index,
                         begin,
                         length,
-                        peer: client.clone(),
                     };
 
+                    let cpeer = client.clone();
                     let cevents = events.clone();
                     tokio::spawn(async move {
-                        cevents.on_canceled_piece_block(piece_block).await;
+                        cevents.on_canceled_piece_block(cpeer, piece_block).await;
                     });
                 }
             }
@@ -952,6 +952,7 @@ fn calc_reader_buff_max_size(piece_size: u32, bitfield_chunks: u32) -> u32 {
 
 #[derive(Debug)]
 pub struct PeerClientInner {
+    addr: SocketAddr,
     state: PeerState,
     bitfield: PeerBitfield,
     writer: Arc<tokio::sync::Mutex<StreamWriter>>,
@@ -959,6 +960,10 @@ pub struct PeerClientInner {
 }
 
 impl PeerClientInner {
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
     pub async fn send_message(&self, message: Message) -> bool {
         if self.state.closed() {
             return false;
@@ -1014,9 +1019,12 @@ impl PeerClient {
     where
         E: PeerEvents,
     {
-        if !accepted_handshake(handshake, &mut stream).await {
-            let socket = stream.peer_addr().unwrap();
-            return Err(PeerError::InvalidHandshake(socket));
+        let accepted = accepted_handshake(handshake, &mut stream).await;
+
+        let addr = stream.peer_addr().unwrap();
+
+        if !accepted {
+            return Err(PeerError::InvalidHandshake(addr));
         }
 
         let bitfield = PeerBitfield::new(torrent.num_pieces() as u32);
@@ -1033,16 +1041,15 @@ impl PeerClient {
 
         let heartbeat_reset = Arc::new(Notify::new());
 
-        let inner = PeerClientInner {
+        let inner = Arc::new(PeerClientInner {
+            addr,
             state: state.clone(),
             bitfield: bitfield.clone(),
             writer: writer.clone(),
             heartbeat_reset: heartbeat_reset.clone(),
-        };
+        });
 
-        let client = Self {
-            inner: Arc::new(inner),
-        };
+        let client = Self { inner };
 
         spawn_heartbeat(
             client.clone(),
@@ -1066,6 +1073,20 @@ impl Deref for PeerClient {
         &self.inner
     }
 }
+
+impl Hash for PeerClient {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state)
+    }
+}
+
+impl PartialEq for PeerClient {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr
+    }
+}
+
+impl Eq for PeerClient {}
 
 #[cfg(test)]
 mod tests {
@@ -1258,9 +1279,11 @@ mod tests {
         });
 
         let stream = listener.self_connect().await;
+        let addr = stream.peer_addr().unwrap();
         let (reader, writer) = stream.into_split();
         let client = PeerClient {
             inner: Arc::new(PeerClientInner {
+                addr,
                 state: state.clone(),
                 bitfield: bitfield.clone(),
                 writer: Arc::new(tokio::sync::Mutex::new(StreamWriter::new(writer))),
@@ -2255,7 +2278,11 @@ mod tests {
         }
 
         impl PeerEvents for EventsMock {
-            async fn on_piece_block_request(&self, piece_block: PieceBlockRequest) {
+            async fn on_piece_block_request(
+                &self,
+                _peer: PeerClient,
+                piece_block: PieceBlockRequest,
+            ) {
                 let _ = self.sender.send(piece_block).await;
             }
         }
@@ -2298,7 +2325,11 @@ mod tests {
         }
 
         impl PeerEvents for EventsMock {
-            async fn on_received_piece_block(&self, piece_block: ReceivedPieceBlock) {
+            async fn on_received_piece_block(
+                &self,
+                _peer: PeerClient,
+                piece_block: ReceivedPieceBlock,
+            ) {
                 let _ = self.sender.send(piece_block).await;
             }
         }
@@ -2341,7 +2372,11 @@ mod tests {
         }
 
         impl PeerEvents for EventsMock {
-            async fn on_canceled_piece_block(&self, piece_block: CanceledPieceBlock) {
+            async fn on_canceled_piece_block(
+                &self,
+                _peer: PeerClient,
+                piece_block: CanceledPieceBlock,
+            ) {
                 let _ = self.sender.send(piece_block).await;
             }
         }
