@@ -71,14 +71,14 @@ fn u32_to_bytes(value: u32) -> [u8; 4] {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Handshake {
+pub struct HandshakeInner {
     protocol: String,
     info_hash: InfoHash,
     peer_id: PeerId,
     encoded: Vec<u8>,
 }
 
-impl Handshake {
+impl HandshakeInner {
     pub fn new(info_hash: InfoHash, peer_id: PeerId) -> Self {
         let mut encoded = vec![0];
 
@@ -100,6 +100,27 @@ impl Handshake {
 
     fn raw(&self) -> &[u8] {
         &self.encoded
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Handshake {
+    inner: Arc<HandshakeInner>,
+}
+
+impl Handshake {
+    pub fn new(info_hash: InfoHash, peer_id: PeerId) -> Self {
+        let inner = Arc::new(HandshakeInner::new(info_hash, peer_id));
+
+        Self { inner }
+    }
+}
+
+impl Deref for Handshake {
+    type Target = HandshakeInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
@@ -741,7 +762,7 @@ fn split_stream(stream: TcpStream, reader_buff_max_size: u32) -> (StreamReader, 
     (stream_reader, stream_writer)
 }
 
-async fn accepted_handshake(handshake: Arc<Handshake>, stream: &mut TcpStream) -> bool {
+async fn accepted_handshake(handshake: Handshake, stream: &mut TcpStream) -> bool {
     let raw = handshake.raw();
 
     if stream.write_all(raw).await.is_err() {
@@ -1011,9 +1032,9 @@ impl PeerClient {
     const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(4000);
 
     pub async fn start<E>(
-        handshake: Arc<Handshake>,
+        handshake: Handshake,
         mut stream: TcpStream,
-        torrent: Arc<Torrent>,
+        torrent: Torrent,
         events: Arc<E>,
     ) -> Result<Self, PeerError>
     where
@@ -1099,9 +1120,8 @@ mod tests {
     };
 
     use futures::future::{BoxFuture, FutureExt};
-    use url::Url;
 
-    use crate::{FileType, InfoHash, Torrent};
+    use crate::{parse_torrent_file, InfoHash};
 
     use super::{
         accepted_handshake, bitfield_chunks, spawn_receiver, stopper, BitfieldIndex,
@@ -1218,7 +1238,7 @@ mod tests {
     async fn validate_handshake<PF>(peer_reply: PF) -> bool
     where
         PF: FnOnce(
-                Arc<Handshake>,
+                Handshake,
                 tokio::net::tcp::OwnedReadHalf,
                 tokio::net::tcp::OwnedWriteHalf,
             ) -> BoxFuture<'static, ()>
@@ -1230,8 +1250,8 @@ mod tests {
 
         let info_hash = InfoHash::hash(&[1, 2, 3, 4]);
         let peer_id = PeerId::build();
-        let handshake = Arc::new(Handshake::new(info_hash, peer_id));
-        let chandshake = Arc::clone(&handshake);
+        let handshake = Handshake::new(info_hash, peer_id);
+        let chandshake = handshake.clone();
 
         let tcli = tokio::spawn(async move {
             let mut stream = clistener.accept().await;
@@ -1309,7 +1329,7 @@ mod tests {
     where
         CF: FnOnce(PeerClient) -> BoxFuture<'static, ()> + Send + 'static,
         PF: FnOnce(
-                Arc<Handshake>,
+                Handshake,
                 tokio::net::tcp::OwnedReadHalf,
                 tokio::net::tcp::OwnedWriteHalf,
             ) -> BoxFuture<'static, ()>
@@ -1319,19 +1339,11 @@ mod tests {
         let listener = LocalListener::build().await;
         let clistener = listener.clone();
 
-        let torrent: Arc<_> = Torrent {
-            tracker: Url::parse("http://localhost:80").unwrap(),
-            piece_length: Message::MAX_PIECE_CHUNK_SZ as u64,
-            hash_pieces: vec![0; 20].try_into().unwrap(),
-            total_length: 0,
-            file_type: FileType::Single {
-                name: "".to_string(),
-            },
-            info_hash: InfoHash([1; 20]),
-        }
-        .into();
+        let raw = b"d8:announce20:https://localhost:804:infod6:lengthi20e4:name\
+            4:file12:piece lengthi20e6:pieces20:AAAAAAAAAAAAAAAAAAAAee";
+        let torrent = parse_torrent_file(raw).unwrap();
         let peer_id = PeerId::build();
-        let handshake = Arc::new(Handshake::new(torrent.info_hash, peer_id));
+        let handshake = Handshake::new(torrent.info_hash, peer_id);
         let chandshake = handshake.clone();
 
         let tpeer = tokio::spawn(async move {
