@@ -2,6 +2,7 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use bendy::decoding::{Decoder, Error, FromBencode, Object, ResultExt};
@@ -303,13 +304,24 @@ pub enum FileType {
 }
 
 #[derive(Debug)]
-pub struct Torrent {
+pub struct TorrentInner {
     pub tracker: Url,
     pub piece_length: u64,
     pub hash_pieces: HashPieces,
     pub total_length: u64,
     pub file_type: FileType,
     pub info_hash: InfoHash,
+}
+
+impl TorrentInner {
+    pub fn num_pieces(&self) -> usize {
+        self.hash_pieces.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Torrent {
+    inner: Arc<TorrentInner>,
 }
 
 impl Torrent {
@@ -321,18 +333,24 @@ impl Torrent {
         file_type: FileType,
         info_hash: InfoHash,
     ) -> Self {
-        Self {
+        let inner = Arc::new(TorrentInner {
             tracker,
             piece_length,
             hash_pieces,
             total_length,
             file_type,
             info_hash,
-        }
-    }
+        });
 
-    pub fn num_pieces(&self) -> usize {
-        self.hash_pieces.len()
+        Self { inner }
+    }
+}
+
+impl Deref for Torrent {
+    type Target = TorrentInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
@@ -468,7 +486,7 @@ impl TryFrom<MetaInfo> for Torrent {
     }
 }
 
-pub fn parse(raw: &[u8]) -> Result<Torrent, TorrentError> {
+pub fn parse_torrent_file(raw: &[u8]) -> Result<Torrent, TorrentError> {
     MetaInfo::from_bencode(raw)
         .map_err(|_| TorrentError::InvalidFile)?
         .try_into()
@@ -481,7 +499,7 @@ mod tests {
     use claims::{assert_matches, assert_none, assert_ok, assert_some_eq};
     use url::Url;
 
-    use super::{parse, FileType, HashPiece, HashPieces, TorrentError};
+    use super::{parse_torrent_file, FileType, HashPiece, HashPieces, TorrentError};
 
     #[test]
     fn get_pieces_chunk_wih_valid_chunk() {
@@ -507,14 +525,14 @@ mod tests {
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        let torrent = assert_ok!(parse(raw));
+        let torrent = assert_ok!(parse_torrent_file(raw));
         assert_eq!(torrent.tracker, Url::parse("https://test.com").unwrap());
         assert_eq!(torrent.piece_length, 1);
         assert_eq!(torrent.num_pieces(), 1);
         assert_eq!(torrent.total_length, 1);
         assert_eq!(torrent.hash_pieces.buf, b"BBBBBBBBBBBBBBBBBBBB".as_slice());
         match torrent.file_type {
-            FileType::Single { name } => {
+            FileType::Single { ref name } => {
                 assert_eq!(name, "test");
             }
             _ => panic!("didn't match single file"),
@@ -525,7 +543,7 @@ mod tests {
     fn parse_valid_torrent_with_multi_file() {
         let raw = b"d8:announce15:http://test.com4:infod5:filesld6:lengthi4e4:pathl5:tests9:test1.txteed6:lengthi4e4:pathl5:tests9:test2.txteed6:lengthi5e4:pathl5:tests9:test3.txteee4:name5:tests12:piece lengthi5e6:pieces60:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAee";
 
-        let torrent = assert_ok!(parse(raw));
+        let torrent = assert_ok!(parse_torrent_file(raw));
         assert_eq!(torrent.tracker, Url::parse("http://test.com").unwrap());
         assert_eq!(torrent.piece_length, 5);
         assert_eq!(torrent.num_pieces(), 3);
@@ -535,7 +553,7 @@ mod tests {
             b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAA".as_slice()
         );
         match torrent.file_type {
-            FileType::Multi { dir, files } => {
+            FileType::Multi { ref dir, ref files } => {
                 assert_eq!(dir, Path::new("tests"));
                 assert_eq!(files.len(), 3);
                 let test1 = &files[0];
@@ -573,7 +591,7 @@ mod tests {
             0xA4, 0x27, 0x71, 0xE0, 0x55, 0xA9,
         ];
 
-        let torrent = assert_ok!(parse(raw));
+        let torrent = assert_ok!(parse_torrent_file(raw));
         assert_eq!(*torrent.info_hash, sha1);
     }
 
@@ -589,7 +607,7 @@ mod tests {
             0x5C, 0xDB, 0xE9, 0xF7, 0x1E, 0x08,
         ];
 
-        let torrent = assert_ok!(parse(raw));
+        let torrent = assert_ok!(parse_torrent_file(raw));
         assert_eq!(*torrent.info_hash, sha1);
     }
 
@@ -598,7 +616,7 @@ mod tests {
         let raw = b"d8:announcei45e4:infod6:lengthi1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
+        assert_matches!(parse_torrent_file(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -606,7 +624,10 @@ mod tests {
         let raw = b"d8:announce19:udp://test.com:69694:infod6:lengthi1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFieldValue("announce")));
+        assert_matches!(
+            parse_torrent_file(raw),
+            Err(TorrentError::InvalidFieldValue("announce"))
+        );
     }
 
     #[test]
@@ -614,7 +635,10 @@ mod tests {
         let raw = b"d8:announce15:https//test.com4:infod6:lengthi1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFieldValue("announce")));
+        assert_matches!(
+            parse_torrent_file(raw),
+            Err(TorrentError::InvalidFieldValue("announce"))
+        );
     }
 
     #[test]
@@ -623,21 +647,21 @@ mod tests {
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.length"))
         );
 
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi9223372036854841342e4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.length"))
         );
 
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi-1e\
             4:name4:test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
+        assert_matches!(parse_torrent_file(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -646,7 +670,7 @@ mod tests {
             4:name5:/test12:piece lengthi1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.name"))
         );
     }
@@ -657,7 +681,7 @@ mod tests {
             4:name4:test12:piece lengthi0e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.piece"))
         );
 
@@ -665,14 +689,14 @@ mod tests {
             4:name4:test12:piece lengthi9223372036854841342e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.piece"))
         );
 
         let raw = b"d8:announce16:https://test.com4:infod6:lengthi1e\
             4:name4:test12:piece lengthi-1e6:pieces20:BBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
+        assert_matches!(parse_torrent_file(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -681,7 +705,7 @@ mod tests {
             4:name4:test12:piece lengthi1e6:pieces14:BBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.pieces"))
         );
     }
@@ -693,7 +717,7 @@ mod tests {
             12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.files.length"))
         );
 
@@ -702,7 +726,7 @@ mod tests {
             12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.files.length"))
         );
 
@@ -710,7 +734,7 @@ mod tests {
             4:pathl5:tests5:test1eed6:lengthi-1e4:pathl5:tests5:test2eee4:name5:tests\
             12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
+        assert_matches!(parse_torrent_file(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -720,7 +744,7 @@ mod tests {
             12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.files.path"))
         );
 
@@ -728,7 +752,7 @@ mod tests {
             4:pathl6:/tests5:test1eed6:lengthi-1e4:pathl5:tests5:test2eee4:name5:tests\
             12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
+        assert_matches!(parse_torrent_file(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -740,7 +764,7 @@ mod tests {
             BBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAee";
 
         assert_matches!(
-            parse(raw),
+            parse_torrent_file(raw),
             Err(TorrentError::InvalidFieldValue("info.pieces"))
         );
     }
@@ -751,7 +775,7 @@ mod tests {
             4:pathl5:tests5:test1eed6:lengthi1e4:pathl5:tests5:test2eee6:lengthi2e\
             4:name5:tests12:piece lengthi2e6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
+        assert_matches!(parse_torrent_file(raw), Err(TorrentError::InvalidFile));
     }
 
     #[test]
@@ -759,6 +783,6 @@ mod tests {
         let raw = b"d8:announce16:https://test.com4:infod4:name5:tests12:piece lengthi2e\
             6:pieces40:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
 
-        assert_matches!(parse(raw), Err(TorrentError::InvalidFile));
+        assert_matches!(parse_torrent_file(raw), Err(TorrentError::InvalidFile));
     }
 }
