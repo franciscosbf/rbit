@@ -2,6 +2,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
     ops::Deref,
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -288,9 +289,10 @@ impl TryFrom<TrackerResponse> for Peers {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct TrackerClient {
     http_client: reqwest::Client,
-    base_url: Url,
+    base_url: Arc<Url>,
 }
 
 impl TrackerClient {
@@ -309,6 +311,8 @@ impl TrackerClient {
             .append_pair("info_hash", bytes_to_str(&info_hash[..]))
             .append_pair("peer_id", bytes_to_str(peer_id))
             .append_pair("compact", "1");
+
+        let base_url = Arc::new(base_url);
 
         Self {
             http_client,
