@@ -595,7 +595,7 @@ impl PeerStateInner {
         self.upload_rate.update(bytes);
     }
 
-    fn close(&self) -> bool {
+    pub fn close(&self) -> bool {
         if !self.closed.set_if_not() {
             return false;
         }
@@ -670,6 +670,9 @@ pub trait PeerEvents: 'static {
     async fn on_not_interest(&self, peer: PeerClient) {
         async {}
     }
+    async fn on_implicit_close(&self, peer: PeerClient) {
+        async {}
+    }
     async fn on_piece_block_request(&self, peer: PeerClient, piece_block: PieceBlockRequest) {
         async {}
     }
@@ -677,9 +680,6 @@ pub trait PeerEvents: 'static {
         async {}
     }
     async fn on_canceled_piece_block(&self, peer: PeerClient, piece_block: CanceledPieceBlock) {
-        async {}
-    }
-    async fn on_implicit_close(&self, peer: PeerClient) {
         async {}
     }
 }
