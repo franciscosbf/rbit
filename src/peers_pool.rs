@@ -243,5 +243,78 @@ impl<IE: InfoEvents, SE: StatsEvents> PeerEvents for EventsGroup<IE, SE> {
 
 #[cfg(test)]
 mod tests {
-    // TODO:
+    use std::{io, sync::Arc};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+    };
+
+    use crate::{parse_torrent_file, Handshake, PeerClient, PeerEvents, PeerId};
+
+    async fn start_messages_forwarder() -> (u16, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("localhost:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (sender, mut receiver) = oneshot::channel();
+
+        tokio::spawn(async move {
+            loop {
+                let stream: TcpStream = tokio::select! {
+                    re = listener.accept() => {
+                        match re {
+                            Ok((stream, _)) => stream,
+                            Err(_) => continue,
+                        }
+                    }
+                    _ = &mut receiver => return,
+                };
+
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = stream.into_split();
+
+                    loop {
+                        let size = reader.read_u32().await?;
+                        let mut payload = vec![0; size as usize];
+
+                        reader.read_exact(&mut payload).await?;
+
+                        let mut msg = vec![];
+                        msg.extend(size.to_be_bytes());
+                        msg.extend(payload);
+
+                        writer.write_all(&msg).await?;
+                    }
+
+                    #[allow(unreachable_code)]
+                    io::Result::Ok(())
+                });
+            }
+        });
+
+        (port, sender)
+    }
+
+    async fn start_dummy_client_with_80_bytes_file_and_20_bytes_piece_size<E: PeerEvents>(
+        port: u16,
+        events: E,
+    ) -> PeerClient {
+        let raw = b"d8:announce20:https://localhost:804:infod6:lengthi80e4:name\
+            4:file12:piece lengthi20e6:pieces80:AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB\
+            AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBee";
+        let torrent = parse_torrent_file(raw).unwrap();
+        let peer_id = PeerId::build();
+        let handshake = Handshake::new(torrent.info_hash, peer_id);
+        let events = Arc::new(events);
+        let stream = TcpStream::connect(format!("localhost:{port}"))
+            .await
+            .expect("Failed to connect to forwarder");
+
+        PeerClient::start(handshake, stream, torrent, events)
+            .await
+            .expect("Failed to create peer client")
+    }
+
+    // TODO: tests
 }
