@@ -530,7 +530,7 @@ mod tests {
 
         let error = tokio::time::timeout(Duration::from_secs(4), error_receiver.recv_async())
             .await
-            .unwrap_or_else(|_| panic!("Didn't receive any error"))
+            .expect("Didn't receive any error")
             .unwrap();
 
         assert_matches!(error, FetcherError::IoError(e)
