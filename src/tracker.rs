@@ -367,7 +367,7 @@ mod tests {
 
     use crate::{InfoHash, PeerAddr, PeerId, TrackerClient};
 
-    use super::{Interval, Peer, Peers, PeersFormat, Success, TrackerError, TrackerResponse};
+    use super::*;
 
     #[test]
     fn parse_failure_response() {

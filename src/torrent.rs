@@ -499,7 +499,7 @@ mod tests {
     use claims::{assert_matches, assert_none, assert_ok, assert_some_eq};
     use url::Url;
 
-    use super::{parse_torrent_file, FileType, HashPiece, HashPieces, TorrentError};
+    use super::*;
 
     #[test]
     fn get_pieces_chunk_wih_valid_chunk() {

@@ -328,9 +328,7 @@ mod tests {
     use claims::{assert_err, assert_matches, assert_ok};
     use tokio::sync::oneshot;
 
-    use super::{
-        spawn_file_handler, Chunk, Fetcher, FetcherError, FetcherEvents, Operation, Segment,
-    };
+    use super::*;
 
     fn gen_random_filename() -> String {
         format!("inner/bytes_file_{}.txt", rand::random::<u64>())

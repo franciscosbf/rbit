@@ -1123,12 +1123,7 @@ mod tests {
 
     use crate::{parse_torrent_file, InfoHash};
 
-    use super::{
-        accepted_handshake, bitfield_chunks, spawn_receiver, stopper, BitfieldIndex,
-        CanceledPieceBlock, Handshake, Message, PeerBitfield, PeerClient, PeerClientInner,
-        PeerError, PeerEvents, PeerId, PeerState, PieceBlockRequest, ReceivedPieceBlock,
-        StopperActor, StreamRead, StreamReader, StreamWriter, Switch,
-    };
+    use super::*;
 
     struct LocalListenerInner {
         listener: tokio::net::TcpListener,
