@@ -1,17 +1,13 @@
 use bytes::BytesMut;
-use futures::{future::Future, task::Poll};
-use leaky_bucket::RateLimiter;
 use running_average::RealTimeRunningAverage;
 use std::{
     hash::Hash,
     net::SocketAddr,
     ops::Deref,
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
-    task::Context,
     time::Duration,
 };
 use thiserror::Error;
@@ -774,34 +770,6 @@ async fn accepted_handshake(handshake: Handshake, stream: &mut TcpStream) -> boo
     stream.read_exact(&mut handshake_reply).await.is_ok()
 }
 
-struct ReceiverTolerance(RateLimiter);
-
-impl ReceiverTolerance {
-    fn new() -> Self {
-        Self(
-            RateLimiter::builder()
-                .initial(3)
-                .max(3)
-                .refill(1)
-                .interval(Duration::from_secs(2))
-                .build(),
-        )
-    }
-}
-
-impl Future for ReceiverTolerance {
-    type Output = bool;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let aquisition = self.0.acquire_one();
-        tokio::pin!(aquisition);
-
-        let tolerate = aquisition.poll(cx).is_ready();
-
-        Poll::Ready(tolerate)
-    }
-}
-
 async fn close_connection_and_call_its_event<E>(client: PeerClient, events: Arc<E>)
 where
     E: PeerEvents,
@@ -852,9 +820,6 @@ where
     E: PeerEvents,
 {
     tokio::spawn(async move {
-        let keep_tolerating = ReceiverTolerance::new();
-        tokio::pin!(keep_tolerating);
-
         loop {
             let read = tokio::select! {
                 _ = checker.stopped() => return,
@@ -863,13 +828,7 @@ where
 
             let message = match read {
                 StreamRead::Received(message) => message,
-                StreamRead::Invalid => {
-                    if (&mut keep_tolerating).await {
-                        continue;
-                    }
-
-                    break;
-                }
+                StreamRead::Invalid => continue,
                 StreamRead::Error | StreamRead::NotReceived => break,
             };
 
@@ -2540,50 +2499,6 @@ mod tests {
                 .boxed()
             },
             EventsMock,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn receiver_gets_4_invalid_messages_and_closes_connection_after_4th_message() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let (sender_coord, mut receiver_coord) = mpsc::channel(1);
-
-        struct EventsMock {
-            sender: mpsc::Sender<()>,
-        }
-
-        impl PeerEvents for EventsMock {
-            async fn on_implicit_close(&self, _peer: PeerClient) {
-                let _ = self.sender.send(()).await;
-            }
-        }
-
-        validate_spawn_receiver_with_8_pieces_and_69_of_buff_size(
-            |state, _| {
-                async move {
-                    while !state.closed() {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-
-                    let _ = receiver.recv().await;
-
-                    let _ = sender_coord.send(()).await;
-                }
-                .boxed()
-            },
-            |mut writer| {
-                async move {
-                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
-                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
-                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
-                    assert_ok!(writer.write_all(b"\x00\x00\x00\x01\xff").await);
-
-                    receiver_coord.recv().await;
-                }
-                .boxed()
-            },
-            EventsMock { sender },
         )
         .await;
     }
