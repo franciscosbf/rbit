@@ -1,6 +1,6 @@
-pub mod client;
-pub mod events;
-pub mod pool;
+mod client;
+mod events;
+mod pool;
 
 pub use client::*;
 pub use events::*;
